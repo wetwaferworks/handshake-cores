@@ -113,6 +113,8 @@ typedef struct gbc_line {
 typedef struct gbc_vsnap {
     uint32_t   frame_no;
     uint8_t    cgb, lcd_on, dmg_palette, vlog_overflow;
+    uint8_t    dmg_pal_auto, _pal_pad[3];
+    uint32_t   dmg_bg[4], dmg_obp0[4], dmg_obp1[4];
     uint32_t   vlog_count;
     uint8_t    vram[0x4000];
     uint8_t    oam[0xA0];
@@ -158,6 +160,8 @@ typedef struct gbc {
     gbc_cpu_t      cpu;
     hs_console_t   console_id;
     uint32_t       dmg_palette;
+    uint8_t        dmg_pal_auto;   /* 1 = CGB boot-ROM palettes (DMG carts) */
+    uint32_t       dmg_bg[4], dmg_obp0[4], dmg_obp1[4];
     uint8_t        cgb;            /* running in CGB mode */
     uint8_t        double_speed, key1, rom_loaded;
 
@@ -265,3 +269,5 @@ void    gbc_ppu_begin_step(gbc_t *g);
 void    gbc_ppu_render_native(const gbc_vsnap_t *s, uint8_t *vram, uint8_t *oam, uint32_t *out);
 
 #endif
+
+void gbc_refresh_dmg_palettes(struct gbc *g);

@@ -20,6 +20,9 @@ static int gbc_init(void *mem, size_t mem_size, const hs_core_config_t *cfg)
     if (g->console_id != HS_SYS_GB && g->console_id != HS_SYS_GBC)
         return -2;
     g->dmg_palette = cfg ? (cfg->dmg_palette & 3u) : 0u;
+    /* cfg provided: keep the historical 0..3 generic ramp (existing tests).
+       No cfg: auto CGB boot-ROM palettes for DMG carts. */
+    g->dmg_pal_auto = cfg ? 0 : 1;
     g->front = 0;
     g->back = 1;
     hs_scaler_init(&g->vid.sc_sharp, GB_W, GB_H, HS_SCALE_STRETCH_SHARP);
@@ -31,6 +34,7 @@ static void gbc_reset(void *core)
 {
     gbc_t *g = (gbc_t *)core;
     g->cgb = (uint8_t)(g->console_id == HS_SYS_GBC && g->rom_loaded && (g->rom[0x143] & 0x80u));
+    gbc_refresh_dmg_palettes(g);
     gbc_mmu_reset(g);
     gbc_ppu_reset(g);
     gbc_apu_reset(&g->apu, g->cgb);

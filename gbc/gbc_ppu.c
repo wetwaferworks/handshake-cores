@@ -13,6 +13,7 @@
  * attributes, priorities and RGB555 palettes. Pure function of snapshot.
  */
 #include "gbc_internal.h"
+#include "gbc_compat_pal.h"
 
 #include <string.h>
 
@@ -43,6 +44,10 @@ static void begin_frame(gbc_t *g)
     s->lcd_on = 1;
     s->cgb = g->cgb;
     s->dmg_palette = (uint8_t)g->dmg_palette;
+    s->dmg_pal_auto = g->dmg_pal_auto;
+    memcpy(s->dmg_bg, g->dmg_bg, sizeof(s->dmg_bg));
+    memcpy(s->dmg_obp0, g->dmg_obp0, sizeof(s->dmg_obp0));
+    memcpy(s->dmg_obp1, g->dmg_obp1, sizeof(s->dmg_obp1));
     g->logging = 1;
     g->win_counter = 0;
     g->win_trig = 0;
@@ -59,6 +64,10 @@ void gbc_ppu_begin_step(gbc_t *g)
     s->lcd_on = 0;
     s->cgb = g->cgb;
     s->dmg_palette = (uint8_t)g->dmg_palette;
+    s->dmg_pal_auto = g->dmg_pal_auto;
+    memcpy(s->dmg_bg, g->dmg_bg, sizeof(s->dmg_bg));
+    memcpy(s->dmg_obp0, g->dmg_obp0, sizeof(s->dmg_obp0));
+    memcpy(s->dmg_obp1, g->dmg_obp1, sizeof(s->dmg_obp1));
     g->logging = 0;
     g->frame_done = 0;
     g->step_dots = 0;
@@ -195,6 +204,26 @@ static const uint32_t dmg_pals[4][4] = {
     { 0xB8FFB0u, 0x50D050u, 0x0B7A20u, 0x001A06u },  /* matrix green */
 };
 
+void gbc_refresh_dmg_palettes(gbc_t *g)
+{
+    int i;
+    if (g->dmg_pal_auto && g->rom_loaded && g->rom != NULL && !g->cgb) {
+        struct hs_dmg_compat c;
+        hs_dmg_compat_from_rom(g->rom, g->rom_size, &c);
+        for (i = 0; i < 4; i++) {
+            g->dmg_bg[i]   = hs_cgb_lcd_rgb888(c.bg[i]);
+            g->dmg_obp0[i] = hs_cgb_lcd_rgb888(c.obp0[i]);
+            g->dmg_obp1[i] = hs_cgb_lcd_rgb888(c.obp1[i]);
+        }
+    } else {
+        const uint32_t *dp = dmg_pals[g->dmg_palette & 3u];
+        for (i = 0; i < 4; i++) {
+            g->dmg_bg[i] = g->dmg_obp0[i] = g->dmg_obp1[i] = dp[i];
+        }
+    }
+}
+
+
 static inline uint32_t rgb555(uint8_t lo, uint8_t hi)
 {
     uint32_t c = (uint32_t)lo | ((uint32_t)hi << 8);
@@ -244,7 +273,9 @@ static void render_line(const gbc_vsnap_t *s, const gbc_line_t *L, const uint8_t
     uint8_t scol[GB_W], sattr[GB_W];
     int cgb = s->cgb;
     uint8_t lcdc = L->lcdc;
-    const uint32_t *dp = dmg_pals[s->dmg_palette & 3u];
+    const uint32_t *dp_bg = s->dmg_bg;
+    const uint32_t *dp_obp0 = s->dmg_obp0;
+    const uint32_t *dp_obp1 = s->dmg_obp1;
     int x;
 
     memset(col, 0, sizeof(col));
@@ -341,7 +372,7 @@ static void render_line(const gbc_vsnap_t *s, const gbc_line_t *L, const uint8_t
             } else {
                 shade = (uint8_t)((L->bgp >> (c * 2u)) & 3u);
             }
-            out[x] = dp[shade];
+            out[x] = use_obj ? ((sattr[x] & 0x10u) ? dp_obp1[shade] : dp_obp0[shade]) : dp_bg[shade];
         }
     }
 }
@@ -349,7 +380,7 @@ static void render_line(const gbc_vsnap_t *s, const gbc_line_t *L, const uint8_t
 void gbc_ppu_render_native(const gbc_vsnap_t *s, uint8_t *vram, uint8_t *oam, uint32_t *out)
 {
     uint32_t ly, k = 0, x;
-    uint32_t blank = s->cgb ? 0xFFFFFFu : dmg_pals[s->dmg_palette & 3u][0];
+    uint32_t blank = s->cgb ? 0xFFFFFFu : s->dmg_bg[0];
     uint32_t n = s->vlog_count;
     if (n > GBC_VLOG_MAX)
         n = GBC_VLOG_MAX;

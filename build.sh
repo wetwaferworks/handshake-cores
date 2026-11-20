@@ -9,7 +9,7 @@ CFLAGS="-std=c11 -Wall -Wextra -Werror -O3 -Iinclude -Icommon -Igbc -Itests"
 LOG=build/logs; mkdir -p "$LOG" build/x86_64 build/aarch64
 : > "$LOG/compile.log"; : > "$LOG/audit.log"
 
-COMPONENT=(common/hs_video.c gbc/gbc_cpu.c gbc/gbc_mmu.c gbc/gbc_ppu.c gbc/gbc_apu.c gbc/gbc_core.c
+COMPONENT=(common/hs_video.c gbc/gbc_cpu.c gbc/gbc_mmu.c gbc/gbc_ppu.c gbc/gbc_apu.c gbc/gbc_core.c gbc/gbc_compat_pal.c
            tests/hs_png.c tests/test_hs_gbc.c tests/test_hs_video.c)
 RUNTIME=(tests/hs_test_host.c)   # monotonic clock for benchmark timing only
 
@@ -46,9 +46,9 @@ done
 echo "hc --audit-elf: $((n_obj-audit_fail))/$n_obj PASS; nm banned lock/thread/clock/rng symbols: $nm_hits"
 
 # ---- link ----
-gcc -O3 -o build/x86_64/test_hs_gbc build/x86_64/{test_hs_gbc,hs_png,hs_test_host,gbc_cpu,gbc_mmu,gbc_ppu,gbc_apu,gbc_core,hs_video}.o
+gcc -O3 -o build/x86_64/test_hs_gbc build/x86_64/{test_hs_gbc,hs_png,hs_test_host,gbc_cpu,gbc_mmu,gbc_ppu,gbc_apu,gbc_core,gbc_compat_pal,hs_video}.o
 gcc -O3 -o build/x86_64/test_hs_video build/x86_64/{test_hs_video,hs_png,hs_test_host,hs_video}.o
-aarch64-linux-gnu-gcc -O3 -static -o build/aarch64/test_hs_gbc build/aarch64/{test_hs_gbc,hs_png,hs_test_host,gbc_cpu,gbc_mmu,gbc_ppu,gbc_apu,gbc_core,hs_video}.o
+aarch64-linux-gnu-gcc -O3 -static -o build/aarch64/test_hs_gbc build/aarch64/{test_hs_gbc,hs_png,hs_test_host,gbc_cpu,gbc_mmu,gbc_ppu,gbc_apu,gbc_core,gbc_compat_pal,hs_video}.o
 aarch64-linux-gnu-gcc -O3 -static -o build/aarch64/test_hs_video build/aarch64/{test_hs_video,hs_png,hs_test_host,hs_video}.o
 # final binaries: no thread / lock symbols pulled in from our code
 for b in build/x86_64/test_hs_gbc build/aarch64/test_hs_gbc; do

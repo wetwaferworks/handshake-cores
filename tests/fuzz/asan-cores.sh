@@ -34,7 +34,7 @@ run() { # name dir args...
   echo "ASAN_RUN $name rc=$rc ubsan_reports=$ub asan_reports=$as"
   [ "$rc" = 0 ] && [ "$as" = 0 ] || fail=1
 }
-G="common/hs_video.c gbc/gbc_cpu.c gbc/gbc_mmu.c gbc/gbc_ppu.c gbc/gbc_apu.c gbc/gbc_core.c tests/hs_png.c tests/hs_test_host.c"
+G="common/hs_video.c gbc/gbc_cpu.c gbc/gbc_mmu.c gbc/gbc_ppu.c gbc/gbc_apu.c gbc/gbc_core.c gbc/gbc_compat_pal.c tests/hs_png.c tests/hs_test_host.c"
 build test_hs_gbc "$ROOT" "-Iinclude -Icommon -Igbc -Itests" "$G tests/test_hs_gbc.c" && run test_hs_gbc "$ROOT" --out="$OUT/test_hs_gbc/out" --roms="$ROOT/../handshakeos/roms"
 build test_hs_video "$ROOT" "-Iinclude -Icommon -Igbc -Itests" "$G tests/test_hs_video.c" && run test_hs_video "$ROOT" --out="$OUT/test_hs_video/out"
 build test_hs_gba "$ROOT/gba" "-Iinclude -Isrc -Itests -I../include" "$(cd gba && echo src/*.c) tests/test_hs_gba.c" && run test_hs_gba "$ROOT/gba" --out "$OUT/test_hs_gba/out"
