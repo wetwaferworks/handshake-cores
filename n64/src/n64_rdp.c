@@ -28,6 +28,12 @@ typedef struct rctx {
     int64_t kx, ky;              /* native 16.16 -> virtual 24.8: v8 = (x16 * k) >> 24 */
     uint32_t nw, nh;
     uint32_t bilinear4;
+    uint32_t ref;                /* HS_N64_CFG_REF_RDP: reference per-pixel path */
+    n64_rstate_t *rs;            /* private raster state of this context */
+    uint64_t *samples;
+    uint32_t *prims;
+    uint32_t pal_valid;          /* fast path: pal[] mirrors the current TLUT */
+    uint32_t pal[256];
 } rctx_t;
 
 void n64_rstate_reset(n64_rstate_t *rs)
@@ -495,7 +501,7 @@ static void draw_tri(rctx_t *c, const n64_rstate_t *rs, const uint32_t *w)
                     }
                     if (shade_pixel(c, rs, &sel, &in, &row[px])) {
                         if (zu) zrow[px] = (uint16_t)zv;
-                        c->v->samples_shaded++;
+                        (*c->samples)++;
                     }
                 }
             }
@@ -505,7 +511,7 @@ static void draw_tri(rctx_t *c, const n64_rstate_t *rs, const uint32_t *w)
         e_c[0] += e_dy[0]; e_c[1] += e_dy[1]; e_c[2] += e_dy[2];
         for (k = 0; k < 8u; k++) A0[k] += DY[k];
     }
-    c->v->prims_drawn++;
+    (*c->prims)++;
 }
 
 /* ---------------------------------------------------------- rectangles */
@@ -555,7 +561,7 @@ static void fill_rect(rctx_t *c, const n64_rstate_t *rs, uint32_t w0, uint32_t w
             for (px = x0; px < x1; px++)
                 shade_pixel(c, rs, &sel, &in, &c->strip[(size_t)(py - (int32_t)c->y0) * c->sw + (uint32_t)px]);
     }
-    c->v->prims_drawn++;
+    (*c->prims)++;
 }
 
 static void tex_rect(rctx_t *c, const n64_rstate_t *rs, const uint32_t *w)
@@ -586,10 +592,10 @@ static void tex_rect(rctx_t *c, const n64_rstate_t *rs, const uint32_t *w)
     for (py = y0; py < y1; py++) {
         /* native position of the sample centre, s15.16 */
         int64_t ny = (((int64_t)py * 256 + 128) << 24) / c->ky;
-        int64_t dy = ny - ((int64_t)yh << 14);
+        int64_t dyr = ny - ((int64_t)yh << 14);
         for (px = x0; px < x1; px++) {
             int64_t nx = (((int64_t)px * 256 + 128) << 24) / c->kx;
-            int64_t dx = nx - ((int64_t)xh << 14);
+            int64_t dx = nx - ((int64_t)xh << 14), dy = dyr;   /* v0.2 fix: flip used to leak dx into later pixels */
             int64_t s16, t16;
             uint32_t *dst = &c->strip[(size_t)(py - (int32_t)c->y0) * c->sw + (uint32_t)px];
             if (flip) { int64_t tmp = dx; dx = dy; dy = tmp; }
@@ -605,7 +611,548 @@ static void tex_rect(rctx_t *c, const n64_rstate_t *rs, const uint32_t *w)
             }
         }
     }
-    c->v->prims_drawn++;
+    (*c->prims)++;
+}
+
+/* ============================================================ fast path
+ * Phase-1 fast path, selected unless HS_N64_CFG_REF_RDP is set. It computes
+ * exactly the same integers as the reference functions above:
+ *   - per-row exact integer span limits from the three edge functions
+ *     (no per-pixel edge tests outside the span); attributes start at
+ *     A0 + n*DX, the same int64 sum as n repeated additions
+ *   - combiner/blender selectors, tile parameters and TLUT colours are
+ *     resolved once per primitive (TLUT once per load) instead of per pixel
+ *   - texture-rectangle column -> native position uses an exact
+ *     quotient/remainder recurrence instead of one 64-bit divide per pixel
+ *   - constant-q (non-perspective) s/t uses a shift when q is a power of 2
+ * No floating point is added; the double setup is still the reference one. */
+enum { V_COMB = 0, V_TEX0 = 4, V_TEX1 = 8, V_PRIM = 12, V_SHADE = 16, V_ENV = 20,
+       V_K255 = 24, V_ZERO = 28, V_NOISE = 32, V_LOD = 33, V_N = 36 };
+
+typedef struct px_pipe {
+    uint8_t ro[2][4], rst[2][4];   /* rgb a,b,c,d: offset into v[], channel stride 0/1 */
+    uint8_t ao[2][4];              /* alpha a,b,c,d offsets */
+    uint8_t oc[2][3][4];           /* [cycle][channel][a,b,c,d] resolved v[] index */
+    uint32_t two, acmp, force;
+    int32_t  athr;
+    uint32_t ps[2], as[2], ms[2], bs[2];
+    int32_t  blc[4], fgc[4];
+} px_pipe_t;
+
+static void sel_ab_f(uint32_t s, int is_a, uint8_t *o, uint8_t *st)
+{
+    if (s <= 5u) { *o = (uint8_t)(s * 4u); *st = 1; return; }
+    *st = 0;
+    if (s == 6u) *o = is_a ? V_K255 : V_ZERO;
+    else if (s == 7u) *o = is_a ? V_NOISE : V_ZERO;
+    else *o = V_ZERO;
+}
+static void sel_c_f(uint32_t s, uint8_t *o, uint8_t *st)
+{
+    if (s <= 5u) { *o = (uint8_t)(s * 4u); *st = 1; return; }
+    *st = 0;
+    if (s >= 7u && s <= 12u) *o = (uint8_t)((s - 7u) * 4u + 3u);
+    else if (s == 14u) *o = V_LOD;
+    else *o = V_ZERO;
+}
+static void sel_d_f(uint32_t s, uint8_t *o, uint8_t *st)
+{
+    if (s <= 5u) { *o = (uint8_t)(s * 4u); *st = 1; return; }
+    *st = 0;
+    *o = (s == 6u) ? V_K255 : V_ZERO;
+}
+static uint8_t sel_a_f(uint32_t s, int is_mul)
+{
+    if (s == 0u) return is_mul ? V_ZERO : (uint8_t)(V_COMB + 3);
+    if (s <= 5u) return (uint8_t)(s * 4u + 3u);
+    if (s == 6u) return is_mul ? V_LOD : V_K255;
+    return V_ZERO;
+}
+
+static void pipe_setup(const n64_rstate_t *rs, px_pipe_t *pp)
+{
+    cc_sel_t s;
+    uint32_t cy, om = rs->om_lo;
+    cc_decode(rs, &s);
+    for (cy = 0; cy < 2u; cy++) {
+        sel_ab_f(s.a[cy], 1, &pp->ro[cy][0], &pp->rst[cy][0]);
+        sel_ab_f(s.b[cy], 0, &pp->ro[cy][1], &pp->rst[cy][1]);
+        sel_c_f(s.c[cy], &pp->ro[cy][2], &pp->rst[cy][2]);
+        sel_d_f(s.d[cy], &pp->ro[cy][3], &pp->rst[cy][3]);
+        pp->ao[cy][0] = sel_a_f(s.aa[cy], 0); pp->ao[cy][1] = sel_a_f(s.ab[cy], 0);
+        pp->ao[cy][2] = sel_a_f(s.ac[cy], 1); pp->ao[cy][3] = sel_a_f(s.ad[cy], 0);
+        {
+            uint32_t ch, j;
+            for (ch = 0; ch < 3u; ch++)
+                for (j = 0; j < 4u; j++) pp->oc[cy][ch][j] = (uint8_t)(pp->ro[cy][j] + ch * pp->rst[cy][j]);
+        }
+        pp->ps[cy] = (om >> (30u - 2u * cy)) & 3u; pp->as[cy] = (om >> (26u - 2u * cy)) & 3u;
+        pp->ms[cy] = (om >> (22u - 2u * cy)) & 3u; pp->bs[cy] = (om >> (18u - 2u * cy)) & 3u;
+    }
+    pp->two = ((rs->om_hi >> 20) & 3u) == 1u;
+    pp->acmp = (om & 3u) == 1u;
+    pp->force = (om & 0x4000u) != 0;
+    pp->athr = (int32_t)(rs->blend & 0xFFu);
+    unpack(rs->blend, pp->blc); unpack(rs->fog, pp->fgc);
+}
+
+static void v_init(int32_t *v)
+{
+    uint32_t i;
+    for (i = 0; i < (uint32_t)V_N; i++) v[i] = 0;
+    v[V_K255] = v[V_K255 + 1] = v[V_K255 + 2] = v[V_K255 + 3] = 255;
+}
+
+static void cc_cycle_f(const px_pipe_t *pp, uint32_t cy, const int32_t *v, int32_t *out)
+{
+    const uint8_t *ao = pp->ao[cy];
+    uint32_t ch;
+    for (ch = 0; ch < 3u; ch++) {
+        const uint8_t *o = pp->oc[cy][ch];
+        out[ch] = clampi((((v[o[0]] - v[o[1]]) * v[o[2]] + 128) >> 8) + v[o[3]], 0, 255);
+    }
+    out[3] = clampi((((v[ao[0]] - v[ao[1]]) * v[ao[2]] + 128) >> 8) + v[ao[3]], 0, 255);
+}
+
+static uint32_t blend_f(const px_pipe_t *pp, uint32_t cy, const int32_t *in, int32_t shade_a, uint32_t mem, int force)
+{
+    uint32_t ps = pp->ps[cy], as = pp->as[cy], ms = pp->ms[cy], bs = pp->bs[cy];
+    int32_t p[3], m[3], memc[3], fa, fb, k;
+    memc[0] = (int32_t)((mem >> 16) & 0xFFu); memc[1] = (int32_t)((mem >> 8) & 0xFFu); memc[2] = (int32_t)(mem & 0xFFu);
+    for (k = 0; k < 3; k++) {
+        p[k] = ps == 0 ? in[k] : (ps == 1 ? memc[k] : (ps == 2 ? pp->blc[k] : pp->fgc[k]));
+        m[k] = ms == 0 ? in[k] : (ms == 1 ? memc[k] : (ms == 2 ? pp->blc[k] : pp->fgc[k]));
+    }
+    if (!force) return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2];
+    fa = as == 0 ? in[3] : (as == 1 ? pp->fgc[3] : (as == 2 ? shade_a : 0));
+    if (bs == 0u) {                 /* fb = 255 - fa: denominator is exactly 255, all terms >= 0 */
+        uint32_t o = 0;
+        fb = 255 - fa;
+        for (k = 0; k < 3; k++) {
+            uint32_t vv = ((uint32_t)(p[k] * fa + m[k] * fb) + 127u) / 255u;
+            o |= (vv > 255u ? 255u : vv) << (16 - 8 * k);
+        }
+        return o;
+    }
+    fb = bs == 3u ? 0 : 255;
+    if (fa + fb == 0) return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2];
+    {
+        uint32_t o = 0;
+        for (k = 0; k < 3; k++) {
+            int32_t vv = (p[k] * fa + m[k] * fb + (fa + fb) / 2) / (fa + fb);
+            o |= (uint32_t)clampi(vv, 0, 255) << (16 - 8 * k);
+        }
+        return o;
+    }
+}
+
+static int shade_f(const px_pipe_t *pp, int32_t *v, uint32_t *dst)
+{
+    int32_t out[4];
+    uint32_t px;
+    v[V_COMB] = v[V_COMB + 1] = v[V_COMB + 2] = v[V_COMB + 3] = 0;
+    cc_cycle_f(pp, 0, v, out);
+    if (pp->two) {
+        v[V_COMB] = out[0]; v[V_COMB + 1] = out[1]; v[V_COMB + 2] = out[2]; v[V_COMB + 3] = out[3];
+        cc_cycle_f(pp, 1, v, out);
+    }
+    if (pp->acmp && (out[3] < pp->athr || out[3] == 0)) return 0;
+    if (pp->two) {
+        uint32_t c0 = blend_f(pp, 0, out, v[V_SHADE + 3], *dst, 1);
+        int32_t mid[4];
+        mid[0] = (int32_t)((c0 >> 16) & 0xFFu); mid[1] = (int32_t)((c0 >> 8) & 0xFFu); mid[2] = (int32_t)(c0 & 0xFFu); mid[3] = out[3];
+        px = blend_f(pp, 1, mid, v[V_SHADE + 3], *dst, (int)pp->force);
+    } else {
+        px = blend_f(pp, 0, out, v[V_SHADE + 3], *dst, (int)pp->force);
+    }
+    *dst = px;
+    return 1;
+}
+
+/* ---- textures */
+typedef struct tex_setup {
+    uint32_t shifts, shiftt, masks, maskt, cms, cmt;
+    int32_t  sl8, tl8, cs, ct;
+    uint32_t base, line8, code, pal4;
+    const uint32_t *pal;
+    uint32_t (*smp)(const struct rctx *c, const uint8_t *m, const struct tex_setup *ts, int32_t s16, int32_t t16, int filt);
+} tex_setup_t;
+
+static void tex_setup(const n64_rstate_t *rs, uint32_t tile, tex_setup_t *ts)
+{
+    const n64_tile_t *tl = &rs->tile[tile & 7u];
+    ts->shifts = tl->shifts; ts->shiftt = tl->shiftt;
+    ts->masks = tl->masks; ts->maskt = tl->maskt; ts->cms = tl->cms; ts->cmt = tl->cmt;
+    ts->sl8 = (int32_t)tl->sl << 3; ts->tl8 = (int32_t)tl->tl << 3;
+    ts->cs = (int32_t)((tl->sh >> 2) - (tl->sl >> 2)); ts->ct = (int32_t)((tl->th >> 2) - (tl->tl >> 2));
+    if (ts->cs < 0) ts->cs = 0;
+    if (ts->ct < 0) ts->ct = 0;
+    ts->base = tl->tmem * 8u; ts->line8 = tl->line * 8u;
+    ts->code = (tl->fmt << 2) | tl->siz; ts->pal4 = tl->pal << 4;
+}
+
+static void pal_build(rctx_t *c, const n64_rstate_t *rs)
+{
+    uint32_t i;
+    for (i = 0; i < 256u; i++) c->pal[i] = tlut_entry(rs, i);
+    c->pal_valid = 1;
+}
+
+/* per-format texel fetch (same arithmetic as fetch_texel; CI reads the TLUT
+ * colours resolved by pal_build for the current TLUT) */
+#define FX_ARGS const tex_setup_t *ts, const uint8_t *m, uint32_t base, uint32_t s
+static uint32_t fx_rgba16(FX_ARGS) { uint32_t a = (base + s * 2u) & 0xFFEu; (void)ts; return c5551(((uint32_t)m[a] << 8) | m[a + 1u]); }
+static uint32_t fx_rgba32(FX_ARGS)
+{ uint32_t a = (base + s * 4u) & 0xFFCu; (void)ts;
+  return ((uint32_t)m[a] << 24) | ((uint32_t)m[a + 1u] << 16) | ((uint32_t)m[a + 2u] << 8) | m[a + 3u]; }
+static uint32_t fx_ci4(FX_ARGS)
+{ uint32_t a = (base + (s >> 1)) & 0xFFFu, v = (s & 1u) ? (m[a] & 15u) : (m[a] >> 4); return ts->pal[(ts->pal4 | v) & 0xFFu]; }
+static uint32_t fx_ci8(FX_ARGS) { uint32_t a = (base + s) & 0xFFFu; return ts->pal[m[a]]; }
+static uint32_t fx_ia4(FX_ARGS)
+{ uint32_t a = (base + (s >> 1)) & 0xFFFu, v = (s & 1u) ? (m[a] & 15u) : (m[a] >> 4), i;
+  (void)ts; i = (v >> 1) * 36u + ((v >> 1) >> 1); i = (uint32_t)clampi((int32_t)i, 0, 255);
+  return (i << 24) | (i << 16) | (i << 8) | ((v & 1u) ? 255u : 0u); }
+static uint32_t fx_ia8(FX_ARGS)
+{ uint32_t a = (base + s) & 0xFFFu, v = m[a], i = (v >> 4) * 17u; (void)ts;
+  return (i << 24) | (i << 16) | (i << 8) | ((v & 15u) * 17u); }
+static uint32_t fx_ia16(FX_ARGS)
+{ uint32_t a = (base + s * 2u) & 0xFFEu, i = m[a]; (void)ts; return (i << 24) | (i << 16) | (i << 8) | m[a + 1u]; }
+static uint32_t fx_i4(FX_ARGS)
+{ uint32_t a = (base + (s >> 1)) & 0xFFFu, v = (s & 1u) ? (m[a] & 15u) : (m[a] >> 4), i = v * 17u; (void)ts;
+  return (i << 24) | (i << 16) | (i << 8) | i; }
+static uint32_t fx_i8(FX_ARGS) { uint32_t a = (base + s) & 0xFFFu, i = m[a]; (void)ts; return (i << 24) | (i << 16) | (i << 8) | i; }
+
+static uint32_t filt3(uint32_t a00, uint32_t a10, uint32_t a01, uint32_t a11, int32_t fs, int32_t ft)
+{
+    uint32_t o = 0, k;
+    if (fs + ft < 32) {
+        for (k = 0; k < 32u; k += 8u) {
+            int32_t p00 = (int32_t)((a00 >> k) & 0xFFu), p10 = (int32_t)((a10 >> k) & 0xFFu);
+            int32_t p01 = (int32_t)((a01 >> k) & 0xFFu);
+            o |= (uint32_t)clampi(p00 + (((p10 - p00) * fs + (p01 - p00) * ft + 16) >> 5), 0, 255) << k;
+        }
+    } else {
+        for (k = 0; k < 32u; k += 8u) {
+            int32_t p10 = (int32_t)((a10 >> k) & 0xFFu), p01 = (int32_t)((a01 >> k) & 0xFFu);
+            int32_t p11 = (int32_t)((a11 >> k) & 0xFFu);
+            o |= (uint32_t)clampi(p11 + (((p01 - p11) * (32 - fs) + (p10 - p11) * (32 - ft) + 16) >> 5), 0, 255) << k;
+        }
+    }
+    return o;
+}
+
+#define DEF_SAMPLER(NAME, FX)                                                                         \
+static uint32_t NAME(const rctx_t *c, const uint8_t *m, const tex_setup_t *ts, int32_t s16, int32_t t16, int filt) \
+{                                                                                                     \
+    int32_t s = shift_coord(s16 >> 11, ts->shifts) - ts->sl8, t = shift_coord(t16 >> 11, ts->shiftt) - ts->tl8; \
+    int32_t si = s >> 5, ti = t >> 5;                                                                 \
+    uint32_t s0 = wrap_coord(si, ts->masks, ts->cms, ts->cs), t0 = wrap_coord(ti, ts->maskt, ts->cmt, ts->ct); \
+    uint32_t s1, t1, b0, b1, a00, a10, a01, a11;                                                      \
+    if (!filt) return FX(ts, m, ts->base + t0 * ts->line8, s0);                                  \
+    s1 = wrap_coord(si + 1, ts->masks, ts->cms, ts->cs);                                              \
+    t1 = wrap_coord(ti + 1, ts->maskt, ts->cmt, ts->ct);                                              \
+    b0 = ts->base + t0 * ts->line8; b1 = ts->base + t1 * ts->line8;                                   \
+    a00 = FX(ts, m, b0, s0); a10 = FX(ts, m, b0, s1);                                       \
+    a01 = FX(ts, m, b1, s0); a11 = FX(ts, m, b1, s1);                                       \
+    if (c->bilinear4) return lerp_c(lerp_c(a00, a10, (uint32_t)(s & 31)), lerp_c(a01, a11, (uint32_t)(s & 31)), (uint32_t)(t & 31)); \
+    return filt3(a00, a10, a01, a11, s & 31, t & 31);                                                 \
+}
+DEF_SAMPLER(smp_rgba16, fx_rgba16)
+DEF_SAMPLER(smp_rgba32, fx_rgba32)
+DEF_SAMPLER(smp_ci4, fx_ci4)
+DEF_SAMPLER(smp_ci8, fx_ci8)
+DEF_SAMPLER(smp_ia4, fx_ia4)
+DEF_SAMPLER(smp_ia8, fx_ia8)
+DEF_SAMPLER(smp_ia16, fx_ia16)
+DEF_SAMPLER(smp_i4, fx_i4)
+DEF_SAMPLER(smp_i8, fx_i8)
+
+static void tex_bind(rctx_t *c, const n64_rstate_t *rs, uint32_t tile, tex_setup_t *ts)
+{
+    tex_setup(rs, tile, ts);
+    switch (ts->code) {
+    case (0u << 2) | 3u: ts->smp = smp_rgba32; break;
+    case (2u << 2) | 0u: ts->smp = smp_ci4; break;
+    case (2u << 2) | 1u: ts->smp = smp_ci8; break;
+    case (3u << 2) | 0u: ts->smp = smp_ia4; break;
+    case (3u << 2) | 1u: ts->smp = smp_ia8; break;
+    case (3u << 2) | 2u: ts->smp = smp_ia16; break;
+    case (4u << 2) | 0u: ts->smp = smp_i4; break;
+    case (4u << 2) | 1u: ts->smp = smp_i8; break;
+    default: ts->smp = smp_rgba16; break;
+    }
+    ts->pal = c->pal;
+    if (ts->code == ((2u << 2) | 0u) || ts->code == ((2u << 2) | 1u)) {
+        if (!c->pal_valid) pal_build(c, rs);
+    }
+}
+
+static void unpack_v(uint32_t col, int32_t *o)
+{ o[0] = (int32_t)(col >> 24); o[1] = (int32_t)((col >> 16) & 0xFFu); o[2] = (int32_t)((col >> 8) & 0xFFu); o[3] = (int32_t)(col & 0xFFu); }
+
+/* floor(a / b) for b > 0 */
+static int64_t floor_div(int64_t a, int64_t b)
+{
+    int64_t q = a / b;
+    if ((a % b) != 0 && a < 0) q--;
+    return q;
+}
+
+static void draw_tri_fast(rctx_t *c, const n64_rstate_t *rs, const uint32_t *w)
+{
+    uint32_t flags = w[0] & 0xFFu, tile = (w[0] >> 8) & 7u;
+    int64_t X[3], Y[3];
+    double attr[3][8];
+    int64_t A0[8], DX[8], DY[8];
+    int64_t area, e_dx[3], e_dy[3], e_c[3], bias[3];
+    int32_t sx0, sy0, sx1, sy1, bx0, by0, bx1, by1, py;
+    uint32_t i, k, cyc = (rs->om_hi >> 20) & 3u;
+    int persp = (rs->om_hi >> 19) & 1u, filt = ((rs->om_hi >> 12) & 3u) >= 2u && cyc < 2u;
+    int zc = (flags & N64_TRI_Z) && (rs->om_lo & 0x10u), zu = (flags & N64_TRI_Z) && (rs->om_lo & 0x20u);
+    int tex = (flags & N64_TRI_TEX) != 0, primz = (rs->om_lo & 0x4u) != 0, need_t1;
+    int64_t wmin = 0x7FFFFFFFLL, qconst = 0;
+    uint32_t qshift = 0, qmode = 0;     /* 0 per-pixel divide, 1 constant divide, 2 constant shift */
+    double area2, x0d, y0d;
+    cc_sel_t sel;
+    px_pipe_t pp;
+    tex_setup_t ts0, ts1;
+    int32_t v[V_N];
+    int idx[3] = {0, 1, 2};
+    uint64_t shaded = 0;
+    for (i = 0; i < 3u; i++) {
+        X[i] = ((int64_t)(int32_t)w[1 + i * 7u] * c->kx) >> 24;
+        Y[i] = ((int64_t)(int32_t)w[2 + i * 7u] * c->ky) >> 24;
+        if ((int32_t)w[4 + i * 7u] < wmin) wmin = (int32_t)w[4 + i * 7u];
+    }
+    area = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
+    if (area == 0) return;
+    if (area < 0) { idx[1] = 2; idx[2] = 1; }
+    {
+        int64_t tx[3], ty[3];
+        for (i = 0; i < 3u; i++) { tx[i] = X[idx[i]]; ty[i] = Y[idx[i]]; }
+        memcpy(X, tx, sizeof(X)); memcpy(Y, ty, sizeof(Y));
+    }
+    scissor_virtual(c, rs, &sx0, &sy0, &sx1, &sy1);
+    {
+        int64_t mnx = X[0], mxx = X[0], mny = Y[0], mxy = Y[0];
+        for (i = 1; i < 3u; i++) {
+            if (X[i] < mnx) mnx = X[i];
+            if (X[i] > mxx) mxx = X[i];
+            if (Y[i] < mny) mny = Y[i];
+            if (Y[i] > mxy) mxy = Y[i];
+        }
+        bx0 = (int32_t)(mnx >> 8); bx1 = (int32_t)((mxx >> 8) + 1);
+        by0 = (int32_t)(mny >> 8); by1 = (int32_t)((mxy >> 8) + 1);
+        if (bx0 < sx0) bx0 = sx0;
+        if (by0 < sy0) by0 = sy0;
+        if (bx1 > sx1) bx1 = sx1;
+        if (by1 > sy1) by1 = sy1;
+        if (bx0 >= bx1 || by0 >= by1) return;
+    }
+    for (i = 0; i < 3u; i++) {
+        uint32_t a = (i + 1u) % 3u, b = (i + 2u) % 3u;
+        int64_t dx = X[b] - X[a], dy = Y[b] - Y[a];
+        e_dx[i] = -dy * 256;
+        e_dy[i] = dx * 256;
+        e_c[i] = dx * (((int64_t)by0 * 256 + 128) - Y[a]) - dy * (((int64_t)bx0 * 256 + 128) - X[a]);
+        bias[i] = (dy < 0 || (dy == 0 && dx > 0)) ? 0 : -1;
+    }
+    for (i = 0; i < 3u; i++) {
+        const uint32_t *vv = &w[1 + (uint32_t)idx[i] * 7u];
+        uint32_t col = vv[6];
+        double wv = (double)(int32_t)vv[3], q = persp && tex ? (double)wmin / (wv > 1.0 ? wv : 1.0) : 1.0;
+        attr[i][0] = (double)(col >> 24); attr[i][1] = (double)((col >> 16) & 0xFFu);
+        attr[i][2] = (double)((col >> 8) & 0xFFu); attr[i][3] = (double)(col & 0xFFu);
+        attr[i][4] = (double)vv[2];
+        attr[i][5] = q * 65536.0;
+        attr[i][6] = (double)(int32_t)vv[4] * q;
+        attr[i][7] = (double)(int32_t)vv[5] * q;
+    }
+    x0d = (double)X[0] / 256.0; y0d = (double)Y[0] / 256.0;
+    area2 = ((double)(X[1] - X[0]) * (double)(Y[2] - Y[0]) - (double)(X[2] - X[0]) * (double)(Y[1] - Y[0])) / 65536.0;
+    for (k = 0; k < 8u; k++) {
+        double d1 = attr[1][k] - attr[0][k], d2 = attr[2][k] - attr[0][k];
+        double ddx = (d1 * ((double)(Y[2] - Y[0]) / 256.0) - d2 * ((double)(Y[1] - Y[0]) / 256.0)) / area2;
+        double ddy = (d2 * ((double)(X[1] - X[0]) / 256.0) - d1 * ((double)(X[2] - X[0]) / 256.0)) / area2;
+        double at = attr[0][k] + ddx * (((double)bx0 + 0.5) - x0d) + ddy * (((double)by0 + 0.5) - y0d);
+        A0[k] = d2fx(at * 65536.0);
+        DX[k] = d2fx(ddx * 65536.0);
+        DY[k] = d2fx(ddy * 65536.0);
+    }
+    cc_decode(rs, &sel);
+    pipe_setup(rs, &pp);
+    v_init(v);
+    unpack_v(rs->prim, v + V_PRIM); unpack_v(rs->env, v + V_ENV);
+    v[V_LOD] = (int32_t)rs->prim_lod;
+    need_t1 = sel.a[0] == 2u || sel.a[1] == 2u || sel.c[0] == 2u || sel.c[1] == 2u ||
+              sel.b[0] == 2u || sel.b[1] == 2u || sel.d[0] == 2u || sel.d[1] == 2u;
+    if (tex) {
+        tex_bind(c, rs, tile, &ts0);
+        tex_bind(c, rs, tile + 1u, &ts1);
+        if (DX[5] == 0 && DY[5] == 0) {
+            qconst = A0[5] >> 16;
+            if (qconst < 1) qconst = 1;
+            qmode = 1;
+            if ((qconst & (qconst - 1)) == 0) { qmode = 2; while ((1LL << qshift) < qconst) qshift++; }
+        }
+    }
+    for (py = by0; py < by1; py++) {
+        int64_t at[8], lo = 0, hi = (int64_t)(bx1 - bx0) - 1;
+        int32_t px, xs, xe;
+        uint32_t *row = c->strip + (size_t)(py - (int32_t)c->y0) * c->sw;
+        uint16_t *zrow = c->z + (size_t)(py - (int32_t)c->y0) * c->sw;
+        /* exact span: E_i(t) = e_c[i] + t*e_dx[i] must satisfy E_i + bias_i >= 0 */
+        for (i = 0; i < 3u && lo <= hi; i++) {
+            int64_t e0 = e_c[i] + bias[i], d = e_dx[i];
+            if (d == 0) { if (e0 < 0) hi = -1; }
+            else if (d > 0) { int64_t t = -floor_div(e0, d); if (t > lo) lo = t; }
+            else { int64_t t = floor_div(e0, -d); if (t < hi) hi = t; }
+        }
+        if (lo <= hi) {
+            xs = bx0 + (int32_t)lo; xe = bx0 + (int32_t)hi + 1;
+            for (k = 0; k < 8u; k++) at[k] = A0[k] + lo * DX[k];
+            for (px = xs; px < xe; px++) {
+                int32_t zv = primz ? (int32_t)(rs->prim_z & 0xFFFFu) : clampi((int32_t)(at[4] >> 16), 0, 65535);
+                if (!zc || (uint32_t)zv <= zrow[px]) {
+                    v[V_SHADE] = clampi((int32_t)(at[0] >> 16), 0, 255);
+                    v[V_SHADE + 1] = clampi((int32_t)(at[1] >> 16), 0, 255);
+                    v[V_SHADE + 2] = clampi((int32_t)(at[2] >> 16), 0, 255);
+                    v[V_SHADE + 3] = clampi((int32_t)(at[3] >> 16), 0, 255);
+                    v[V_NOISE] = (int32_t)(((uint32_t)px * 0x9E37u ^ (uint32_t)py * 0x7F4Bu) >> 4 & 0xFFu);
+                    if (tex) {
+                        int32_t s16, t16;
+                        if (qmode == 2u) {
+                            int64_t a6 = at[6], a7 = at[7], bias6 = (int64_t)((1ULL << qshift) - 1u);
+                            s16 = (int32_t)((a6 + (a6 < 0 ? bias6 : 0)) >> qshift);
+                            t16 = (int32_t)((a7 + (a7 < 0 ? bias6 : 0)) >> qshift);
+                        } else {
+                            int64_t qd = qconst;
+                            if (qmode == 0u) { qd = at[5] >> 16; if (qd < 1) qd = 1; }
+                            s16 = (int32_t)(at[6] / qd);
+                            t16 = (int32_t)(at[7] / qd);
+                        }
+                        unpack_v(ts0.smp(c, rs->tmem, &ts0, s16, t16, filt), v + V_TEX0);
+                        if (need_t1) unpack_v(ts1.smp(c, rs->tmem, &ts1, s16, t16, filt), v + V_TEX1);
+                    }
+                    if (shade_f(&pp, v, &row[px])) {
+                        if (zu) zrow[px] = (uint16_t)zv;
+                        shaded++;
+                    }
+                }
+                for (k = 0; k < 8u; k++) at[k] += DX[k];
+            }
+        }
+        e_c[0] += e_dy[0]; e_c[1] += e_dy[1]; e_c[2] += e_dy[2];
+        for (k = 0; k < 8u; k++) A0[k] += DY[k];
+    }
+    *c->samples += shaded;
+    (*c->prims)++;
+}
+
+static void fill_rect_fast(rctx_t *c, const n64_rstate_t *rs, uint32_t w0, uint32_t w1)
+{
+    uint32_t cyc = (rs->om_hi >> 20) & 3u;
+    int32_t xl = (int32_t)((w0 >> 12) & 0xFFFu), yl = (int32_t)(w0 & 0xFFFu);
+    int32_t xh = (int32_t)((w1 >> 12) & 0xFFFu), yh = (int32_t)(w1 & 0xFFFu);
+    int32_t sx0, sy0, sx1, sy1, x0, y0, x1, y1, px, py;
+    int ztarget = rs->cimg_addr == rs->zimg_addr && rs->zimg_addr != 0u;
+    if (cyc >= 2u) { xl += 4; yl += 4; }
+    scissor_virtual(c, rs, &sx0, &sy0, &sx1, &sy1);
+    x0 = (int32_t)((((int64_t)xh << 14) * c->kx) >> 32); x1 = (int32_t)((((int64_t)xl << 14) * c->kx) >> 32);
+    y0 = (int32_t)((((int64_t)yh << 14) * c->ky) >> 32); y1 = (int32_t)((((int64_t)yl << 14) * c->ky) >> 32);
+    if (x0 < sx0) x0 = sx0;
+    if (y0 < sy0) y0 = sy0;
+    if (x1 > sx1) x1 = sx1;
+    if (y1 > sy1) y1 = sy1;
+    if (x0 >= x1 || y0 >= y1) return;
+    if (ztarget) {
+        uint16_t zv = (uint16_t)((rs->fill >> 16) >= 0xFFF0u ? 0xFFFFu : (rs->fill >> 16));
+        for (py = y0; py < y1; py++) {
+            uint16_t *zr = c->z + (size_t)(py - (int32_t)c->y0) * c->sw;
+            for (px = x0; px < x1; px++) zr[px] = zv;
+        }
+        return;
+    }
+    if (cyc == 3u) {
+        uint32_t col = fill_rgb(rs);
+        for (py = y0; py < y1; py++) {
+            uint32_t *r = c->strip + (size_t)(py - (int32_t)c->y0) * c->sw;
+            for (px = x0; px < x1; px++) r[px] = col;
+        }
+    } else {
+        px_pipe_t pp;
+        int32_t v[V_N];
+        pipe_setup(rs, &pp);
+        v_init(v);
+        unpack_v(rs->prim, v + V_PRIM); unpack_v(rs->env, v + V_ENV);
+        v[V_LOD] = (int32_t)rs->prim_lod;
+        for (py = y0; py < y1; py++) {
+            uint32_t *r = c->strip + (size_t)(py - (int32_t)c->y0) * c->sw;
+            for (px = x0; px < x1; px++) shade_f(&pp, v, &r[px]);
+        }
+    }
+    (*c->prims)++;
+}
+
+static void tex_rect_fast(rctx_t *c, const n64_rstate_t *rs, const uint32_t *w)
+{
+    uint32_t cyc = (rs->om_hi >> 20) & 3u, tile = (w[1] >> 24) & 7u;
+    int32_t xl = (int32_t)((w[0] >> 12) & 0xFFFu), yl = (int32_t)(w[0] & 0xFFFu);
+    int32_t xh = (int32_t)((w[1] >> 12) & 0xFFFu), yh = (int32_t)(w[1] & 0xFFFu);
+    int32_t s0 = (int16_t)(w[2] >> 16), t0 = (int16_t)(w[2] & 0xFFFFu);
+    int32_t dsdx = (int16_t)(w[3] >> 16), dtdy = (int16_t)(w[3] & 0xFFFFu);
+    int32_t sx0, sy0, sx1, sy1, x0, y0, x1, y1, px, py;
+    int filt = ((rs->om_hi >> 12) & 3u) >= 2u && cyc < 2u;
+    int flip = ((w[0] >> 24) & 0x3Fu) == 0x25u;
+    px_pipe_t pp;
+    tex_setup_t ts;
+    int32_t v[V_N];
+    int64_t nxq0, nxr0, stq, str;
+    if (cyc >= 2u) { xl += 4; yl += 4; }
+    if (cyc == 2u) dsdx >>= 2;
+    scissor_virtual(c, rs, &sx0, &sy0, &sx1, &sy1);
+    x0 = (int32_t)((((int64_t)xh << 14) * c->kx) >> 32); x1 = (int32_t)((((int64_t)xl << 14) * c->kx) >> 32);
+    y0 = (int32_t)((((int64_t)yh << 14) * c->ky) >> 32); y1 = (int32_t)((((int64_t)yl << 14) * c->ky) >> 32);
+    if (x0 < sx0) x0 = sx0;
+    if (y0 < sy0) y0 = sy0;
+    if (x1 > sx1) x1 = sx1;
+    if (y1 > sy1) y1 = sy1;
+    if (x0 >= x1 || y0 >= y1) return;
+    pipe_setup(rs, &pp);
+    tex_bind(c, rs, tile, &ts);
+    v_init(v);
+    unpack_v(rs->prim, v + V_PRIM); unpack_v(rs->env, v + V_ENV);
+    /* nx(px) = ((px*256+128) << 24) / kx, numerators >= 0 (x0 >= 0): step by 2^32 */
+    {
+        int64_t num = ((int64_t)x0 * 256 + 128) << 24;
+        nxq0 = num / c->kx; nxr0 = num % c->kx;
+        stq = ((int64_t)1 << 32) / c->kx; str = ((int64_t)1 << 32) % c->kx;
+    }
+    for (py = y0; py < y1; py++) {
+        int64_t ny = (((int64_t)py * 256 + 128) << 24) / c->ky;
+        int64_t dyr = ny - ((int64_t)yh << 14);
+        int64_t nq = nxq0, nr = nxr0;
+        uint32_t *rowp = c->strip + (size_t)(py - (int32_t)c->y0) * c->sw;
+        for (px = x0; px < x1; px++) {
+            int64_t dx = nq - ((int64_t)xh << 14), dy = dyr;
+            int64_t s16, t16;
+            uint32_t *dst = &rowp[px];
+            nq += stq; nr += str;
+            if (nr >= c->kx) { nr -= c->kx; nq++; }
+            if (flip) { int64_t tmp = dx; dx = dy; dy = tmp; }
+            s16 = ((int64_t)s0 << 11) + ((dx * dsdx) >> 10);
+            t16 = ((int64_t)t0 << 11) + ((dy * dtdy) >> 10);
+            unpack_v(ts.smp(c, rs->tmem, &ts, (int32_t)s16, (int32_t)t16, filt), v + V_TEX0);
+            if (cyc == 2u) {
+                if ((rs->om_lo & 3u) && v[V_TEX0 + 3] == 0) continue;
+                *dst = ((uint32_t)v[V_TEX0] << 16) | ((uint32_t)v[V_TEX0 + 1] << 8) | (uint32_t)v[V_TEX0 + 2];
+            } else {
+                v[V_SHADE] = v[V_SHADE + 1] = v[V_SHADE + 2] = v[V_SHADE + 3] = 0;
+                shade_f(&pp, v, dst);
+            }
+        }
+    }
+    (*c->prims)++;
 }
 
 /* ---------------------------------------------------------- replay */
@@ -619,7 +1166,7 @@ static void replay(rctx_t *c, n64_rstate_t *rs)
         switch (op) {
         case N64_OP_HS_TRI:
             if (pos + N64_TRI_WORDS > s->rdp_n) return;
-            draw_tri(c, rs, w);
+            if (c->ref) draw_tri(c, rs, w); else draw_tri_fast(c, rs, w);
             pos += N64_TRI_WORDS;
             continue;
         case N64_OP_HS_TIMG:
@@ -630,17 +1177,17 @@ static void replay(rctx_t *c, n64_rstate_t *rs)
             continue;
         case 0x24: case 0x25:
             if (pos + 4u > s->rdp_n) return;
-            tex_rect(c, rs, w);
+            if (c->ref) tex_rect(c, rs, w); else tex_rect_fast(c, rs, w);
             pos += 4u;
             continue;
         case 0x2D: rs->sc_x0 = (int32_t)((w[0] >> 12) & 0xFFFu); rs->sc_y0 = (int32_t)(w[0] & 0xFFFu);
                    rs->sc_x1 = (int32_t)((w[1] >> 12) & 0xFFFu); rs->sc_y1 = (int32_t)(w[1] & 0xFFFu); break;
         case 0x2E: rs->prim_z = w[1] >> 16; break;
-        case 0x2F: rs->om_hi = w[0] & 0x00FFFFFFu; rs->om_lo = w[1]; break;
-        case 0x30: case 0x33: case 0x34: do_load(s, rs, op, w[0], w[1]); break;
+        case 0x2F: rs->om_hi = w[0] & 0x00FFFFFFu; rs->om_lo = w[1]; c->pal_valid = 0; break;
+        case 0x30: case 0x33: case 0x34: do_load(s, rs, op, w[0], w[1]); c->pal_valid = 0; break;
         case 0x32: set_tile_size(rs, w[0], w[1]); break;
         case 0x35: set_tile(rs, w[0], w[1]); break;
-        case 0x36: fill_rect(c, rs, w[0], w[1]); break;
+        case 0x36: if (c->ref) fill_rect(c, rs, w[0], w[1]); else fill_rect_fast(c, rs, w[0], w[1]); break;
         case 0x37: rs->fill = w[1]; break;
         case 0x38: rs->fog = w[1]; break;
         case 0x39: rs->blend = w[1]; break;
@@ -658,39 +1205,111 @@ static void replay(rctx_t *c, n64_rstate_t *rs)
 static void strip_cb(void *user, uint32_t *strip, uint32_t strip_w, uint32_t y0_hi, uint32_t rows_hi, uint32_t ss)
 {
     rctx_t *c = (rctx_t *)user;
-    n64_rstate_t *rs = &c->v->rs;
+    n64_rstate_t *rs = c->rs;
     size_t i, cnt = (size_t)strip_w * rows_hi;
     c->strip = strip; c->sw = strip_w; c->y0 = y0_hi; c->rows = rows_hi; c->ss = ss;
     for (i = 0; i < cnt; i++) { strip[i] = 0; c->z[i] = 0xFFFFu; }
     n64_rstate_reset(rs);
+    c->pal_valid = 0;
     rs->sc_x1 = (int32_t)(c->nw << 2); rs->sc_y1 = (int32_t)(c->nh << 2);
     replay(c, rs);
+}
+
+static void ctx_init(rctx_t *c, const hs_n64_t *n, uint32_t ss, int fxaa)
+{
+    const n64_snap_t *s = n64_front(n);
+    memset(c, 0, sizeof(*c));
+    c->s = s;
+    c->nw = s->native_w ? s->native_w : 320u;
+    c->nh = s->native_h ? s->native_h : 240u;
+    c->bilinear4 = (n->cfg_flags & HS_N64_CFG_BILINEAR4) != 0;
+    c->ref = (n->cfg_flags & HS_N64_CFG_REF_RDP) != 0;
+    if (fxaa) {
+        c->kx = ((int64_t)HS_FB_W << 16) / c->nw;
+        c->ky = ((int64_t)HS_FB_H << 16) / c->nh;
+    } else {
+        c->kx = ((int64_t)HS_FB_W * ss << 16) / c->nw;
+        c->ky = ((int64_t)HS_FB_H * ss << 16) / c->nh;
+    }
+}
+
+/* Same strip partition as hs_ssaa_render (the strip y0 fixes each primitive's
+ * setup origin, so the partition is part of the bit-exact output). Strips
+ * index, index+count, ... are rendered: any subset of strips writes exactly
+ * the rows it would write in a full render. At 1x with a 640-wide target the
+ * strip is rendered in place (hs_ssaa_downsample at ss=1 is a plain copy). */
+static void render_strips(rctx_t *c, uint32_t *strip_buf, uint32_t ss, uint32_t *dst, size_t stride,
+                          uint32_t index, uint32_t count)
+{
+    uint32_t rows = hs_ssaa_rows_per_strip(ss), y, k = 0;
+    for (y = 0; y < HS_FB_H; y += rows, k++) {
+        uint32_t r = rows;
+        if (k % count != index) continue;
+        if (y + r > HS_FB_H) r = HS_FB_H - y;
+        if (ss == 1u && stride == HS_FB_W && !c->ref) {
+            strip_cb(c, dst + (size_t)y * stride, HS_FB_W, y, r, 1u);
+        } else {
+            strip_cb(c, strip_buf, HS_FB_W * ss, y * ss, r * ss, ss);
+            hs_ssaa_downsample(strip_buf, ss, r, dst + (size_t)y * stride, stride);
+        }
+    }
 }
 
 void n64_render(hs_n64_t *n, uint32_t *fb, size_t stride, hs_video_mode_t mode)
 {
     n64_video_t *v = &n->video;
-    const n64_snap_t *s = n64_front(n);
     rctx_t c;
     uint32_t ss = hs_ssaa_factor(mode);
-    memset(&c, 0, sizeof(c));
-    c.v = v; c.s = s; c.z = v->zstrip;
-    c.nw = s->native_w ? s->native_w : 320u;
-    c.nh = s->native_h ? s->native_h : 240u;
-    c.bilinear4 = (n->cfg_flags & HS_N64_CFG_BILINEAR4) != 0;
-    v->src = s;
+    ctx_init(&c, n, ss, mode == HS_AA_FXAA);
+    c.v = v; c.z = v->zstrip; c.rs = &v->rs; c.samples = &v->samples_shaded; c.prims = &v->prims_drawn;
+    v->src = c.s;
     v->samples_shaded = 0;
     v->prims_drawn = 0;
     if (mode == HS_AA_FXAA) {
-        c.kx = ((int64_t)HS_FB_W << 16) / c.nw;
-        c.ky = ((int64_t)HS_FB_H << 16) / c.nh;
-        hs_ssaa_render(1u, strip_cb, &c, v->strip, v->fb1x, HS_FB_W);
+        if (c.ref) hs_ssaa_render(1u, strip_cb, &c, v->strip, v->fb1x, HS_FB_W);
+        else render_strips(&c, v->strip, 1u, v->fb1x, HS_FB_W, 0u, 1u);
         hs_fxaa(v->fb1x, HS_FB_W, fb, stride, HS_FB_W, HS_FB_H, v->luma);
         return;
     }
-    c.kx = ((int64_t)HS_FB_W * ss << 16) / c.nw;
-    c.ky = ((int64_t)HS_FB_H * ss << 16) / c.nh;
-    hs_ssaa_render(ss, strip_cb, &c, v->strip, fb, stride);
+    if (c.ref) hs_ssaa_render(ss, strip_cb, &c, v->strip, fb, stride);
+    else render_strips(&c, v->strip, ss, fb, stride, 0u, 1u);
+}
+
+/* ---- slices: strip-interleaved partitions of one frame for separate cores */
+size_t hs_n64_slice_size(void) { return sizeof(n64_slice_scratch_t); }
+
+int hs_n64_render_slice_ctx(const void *core, void *scratch, size_t scratch_size,
+                            uint32_t *fb, size_t stride, hs_video_mode_t mode,
+                            uint32_t index, uint32_t count)
+{
+    const hs_n64_t *n = (const hs_n64_t *)core;
+    n64_slice_scratch_t *sc = (n64_slice_scratch_t *)scratch;
+    rctx_t c;
+    uint32_t ss = hs_ssaa_factor(mode);
+    if (!n || !sc || scratch_size < sizeof(*sc) || !fb || mode == HS_AA_FXAA) return -1;
+    if (count < 1u || count > HS_N64_MAX_SLICES || index >= count) return -1;
+    ctx_init(&c, n, ss, 0);
+    c.v = NULL; c.z = sc->zstrip; c.rs = &sc->rs; c.samples = &sc->samples; c.prims = &sc->prims;
+    sc->samples = 0; sc->prims = 0;
+    render_strips(&c, sc->strip, ss, fb, stride, index, count);
+    return 0;
+}
+
+void hs_n64_render_slice(void *core, uint32_t *fb, size_t stride, hs_video_mode_t mode,
+                         uint32_t index, uint32_t count)
+{
+    hs_n64_t *n = (hs_n64_t *)core;
+    n64_video_t *v = &n->video;
+    rctx_t c;
+    uint32_t ss = hs_ssaa_factor(mode);
+    if (mode == HS_AA_FXAA || count < 1u || count > HS_N64_MAX_SLICES || index >= count) {
+        if (index == 0u) n64_render(n, fb, stride, mode);
+        return;
+    }
+    ctx_init(&c, n, ss, 0);
+    c.v = v; c.z = v->zstrip; c.rs = &v->rs; c.samples = &v->samples_shaded; c.prims = &v->prims_drawn;
+    if (index == 0u) { v->samples_shaded = 0; v->prims_drawn = 0; v->src = c.s; }
+    render_strips(&c, v->strip, ss, fb, stride, index, count);
 }
 
 /* ---------------------------------------------- Panfrost/GLES backend walk */

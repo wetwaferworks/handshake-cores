@@ -25,6 +25,22 @@ extern "C" {
 /* hs_core_config_t.flags bits for the N64 core */
 #define HS_N64_CFG_EXPANSION_PAK 0x1u   /* 8 MiB RDRAM instead of 4 MiB */
 #define HS_N64_CFG_BILINEAR4     0x2u   /* 4-tap bilinear instead of the RDP 3-point filter */
+#define HS_N64_CFG_REF_INTERP    0x4u   /* diagnostic: reference interpreter (no fetch fast path / decode cache) */
+#define HS_N64_CFG_REF_RDP       0x8u   /* diagnostic: reference per-pixel RDP path */
+#define HS_N64_CFG_SAVE_SHIFT    4u     /* bits 4-6: 0 auto (ROM header ID), 1 none, 2 EEPROM 4K, 3 EEPROM 16K, 4 SRAM, 5 FlashRAM */
+#define HS_N64_CFG_SAVE(t)       ((uint32_t)(t) << HS_N64_CFG_SAVE_SHIFT)
+#define HS_N64_CFG_CONTROLLER_PAK 0x80u /* 32 KiB controller pak in port 1 (saved after the cartridge save) */
+
+#define HS_N64_MAX_SLICES 4u
+/* Independent strip-aligned slices. Each index needs its own scratch context
+ * (hs_n64_slice_size bytes, 64-byte aligned); use hs_n64_render_slice_ctx.
+ * The convenience form below is sequential only, reuses core video scratch. */
+size_t hs_n64_slice_size(void);
+int hs_n64_render_slice_ctx(const void *core, void *scratch, size_t scratch_size,
+                            uint32_t *fb, size_t stride, hs_video_mode_t mode,
+                            uint32_t index, uint32_t count);
+void hs_n64_render_slice(void *core, uint32_t *fb, size_t stride, hs_video_mode_t mode,
+                          uint32_t index, uint32_t count);
 
 extern const hs_core_ops_t hs_n64_core_ops;
 

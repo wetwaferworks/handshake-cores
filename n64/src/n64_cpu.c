@@ -628,14 +628,209 @@ static int exec_one(hs_n64_t *n, uint32_t ins)
     return 0;
 }
 
+/* Direct RAM fetch keeps the reference exception/MMIO/TLB path for everything
+ * else. The mapping condition intentionally matches translate(), including
+ * its treatment of high address bits. Read raw bytes on EVERY execution:
+ * raw-word cache validation handles CPU stores, PI/SP DMA, aliases and callers
+ * modifying RAM without any invalidation hooks or stale translated pointers. */
+static int fetch_fast(hs_n64_t *n, uint64_t pc, uint32_t *ins)
+{
+    uint32_t va = (uint32_t)pc, pa = va & 0x1FFFFFFFu;
+    uint64_t w;
+    if ((va & 0xC0000003u) == 0x80000000u && pa < n->rdram_size) {
+        *ins = n64_be32(n->rdram + pa);
+        return 1;
+    }
+    if (!vload(n, pc, 4, &w)) return 0;
+    *ins = (uint32_t)w;
+    return 1;
+}
+
+static const n64_decoded_t *decode_cached(hs_n64_t *n, uint32_t ins)
+{
+    n64_decoded_t *d = &n->decoded[((uint32_t)n->cpu.pc >> 2) & (N64_DECODE_ENTRIES - 1u)];
+    if (!d->valid || d->raw != ins) {
+        d->raw = ins; d->op = (uint8_t)(ins >> 26);
+        d->rs = (uint8_t)((ins >> 21) & 31u); d->rt = (uint8_t)((ins >> 16) & 31u);
+        d->rd = (uint8_t)((ins >> 11) & 31u); d->sa = (uint8_t)((ins >> 6) & 31u);
+        d->fn = (uint8_t)(ins & 63u); d->imm = (int16_t)(uint16_t)ins;
+        d->valid = 1;
+    }
+    return d;
+}
+
+/* Direct RDRAM data access for KSEG0/KSEG1 (unmapped) addresses: exactly the
+ * vload/vstore result for an aligned access that translate() maps below
+ * rdram_size. Returns NULL when the reference path must be used (unaligned,
+ * TLB-mapped, MMIO, out of range). */
+static uint8_t *ram_ptr(hs_n64_t *n, uint64_t va, uint32_t size)
+{
+    uint32_t v = (uint32_t)va, pa = v & 0x1FFFFFFFu;
+    if ((v & 0xC0000000u) != 0x80000000u || (v & (size - 1u)) || pa + size > n->rdram_size) return NULL;
+    return n->rdram + pa;
+}
+
+/* Hot subset with no exceptions possible (or memory ops proven to hit plain
+ * RDRAM). Every other instruction - and every memory op that could fault or
+ * touch MMIO - goes to the reference exec_one(). Timer/Random/interrupt
+ * bookkeeping stays per instruction in n64_cpu_run. */
+static int exec_decoded(hs_n64_t *n, const n64_decoded_t *d)
+{
+    n64_cpu_t *c = &n->cpu;
+    uint64_t *r = c->gpr;
+    uint64_t target;
+    uint8_t *p;
+    int taken;
+    switch (d->op) {
+    case 0x00:
+        switch (d->fn) {
+        case 0x00: r[d->rd] = SX32((uint32_t)r[d->rt] << d->sa); break;
+        case 0x02: r[d->rd] = SX32((uint32_t)r[d->rt] >> d->sa); break;
+        case 0x03: r[d->rd] = SX32((uint32_t)((int32_t)(uint32_t)r[d->rt] >> d->sa)); break;
+        case 0x21: r[d->rd] = SX32((uint32_t)r[d->rs] + (uint32_t)r[d->rt]); break;
+        case 0x23: r[d->rd] = SX32((uint32_t)r[d->rs] - (uint32_t)r[d->rt]); break;
+        case 0x24: r[d->rd] = r[d->rs] & r[d->rt]; break;
+        case 0x25: r[d->rd] = r[d->rs] | r[d->rt]; break;
+        case 0x26: r[d->rd] = r[d->rs] ^ r[d->rt]; break;
+        case 0x27: r[d->rd] = ~(r[d->rs] | r[d->rt]); break;
+        case 0x2A: r[d->rd] = (int64_t)r[d->rs] < (int64_t)r[d->rt]; break;
+        case 0x2B: r[d->rd] = r[d->rs] < r[d->rt]; break;
+        case 0x2D: r[d->rd] = r[d->rs] + r[d->rt]; break;
+        case 0x2F: r[d->rd] = r[d->rs] - r[d->rt]; break;
+        case 0x38: r[d->rd] = r[d->rt] << d->sa; break;
+        case 0x3A: r[d->rd] = r[d->rt] >> d->sa; break;
+        case 0x3C: r[d->rd] = r[d->rt] << (d->sa + 32u); break;
+        case 0x3E: r[d->rd] = r[d->rt] >> (d->sa + 32u); break;
+        default: return exec_one(n, d->raw);
+        }
+        break;
+    case 0x04: case 0x05:
+        taken = (r[d->rs] == r[d->rt]);
+        if (d->op == 0x05) taken = !taken;
+        if (!taken) break;
+        target = c->pc + 4u + ((uint64_t)(int64_t)d->imm << 2);
+        c->pc = c->npc; c->npc = target; c->next_delay = 1;
+        r[0] = 0;
+        return 1;
+    case 0x09: r[d->rt] = SX32((uint32_t)r[d->rs] + (uint32_t)(uint64_t)(int64_t)d->imm); break;
+    case 0x0A: r[d->rt] = (int64_t)r[d->rs] < (int64_t)d->imm; break;
+    case 0x0B: r[d->rt] = r[d->rs] < (uint64_t)(int64_t)d->imm; break;
+    case 0x0C: r[d->rt] = r[d->rs] & (uint16_t)d->raw; break;
+    case 0x0D: r[d->rt] = r[d->rs] | (uint16_t)d->raw; break;
+    case 0x0E: r[d->rt] = r[d->rs] ^ (uint16_t)d->raw; break;
+    case 0x0F: r[d->rt] = SX32((uint32_t)(d->raw << 16)); break;
+    case 0x19: r[d->rt] = r[d->rs] + (uint64_t)(int64_t)d->imm; break;
+    case 0x20: if (!(p = ram_ptr(n, r[d->rs] + (uint64_t)(int64_t)d->imm, 1))) return exec_one(n, d->raw);
+               r[d->rt] = (uint64_t)(int64_t)(int8_t)p[0]; break;
+    case 0x21: if (!(p = ram_ptr(n, r[d->rs] + (uint64_t)(int64_t)d->imm, 2))) return exec_one(n, d->raw);
+               r[d->rt] = (uint64_t)(int64_t)(int16_t)n64_be16(p); break;
+    case 0x23: if (!(p = ram_ptr(n, r[d->rs] + (uint64_t)(int64_t)d->imm, 4))) return exec_one(n, d->raw);
+               r[d->rt] = SX32(n64_be32(p)); break;
+    case 0x24: if (!(p = ram_ptr(n, r[d->rs] + (uint64_t)(int64_t)d->imm, 1))) return exec_one(n, d->raw);
+               r[d->rt] = p[0]; break;
+    case 0x25: if (!(p = ram_ptr(n, r[d->rs] + (uint64_t)(int64_t)d->imm, 2))) return exec_one(n, d->raw);
+               r[d->rt] = n64_be16(p); break;
+    case 0x27: if (!(p = ram_ptr(n, r[d->rs] + (uint64_t)(int64_t)d->imm, 4))) return exec_one(n, d->raw);
+               r[d->rt] = n64_be32(p); break;
+    case 0x37: if (!(p = ram_ptr(n, r[d->rs] + (uint64_t)(int64_t)d->imm, 8))) return exec_one(n, d->raw);
+               r[d->rt] = ((uint64_t)n64_be32(p) << 32) | n64_be32(p + 4); break;
+    case 0x28: if (!(p = ram_ptr(n, r[d->rs] + (uint64_t)(int64_t)d->imm, 1))) return exec_one(n, d->raw);
+               p[0] = (uint8_t)r[d->rt]; break;
+    case 0x29: if (!(p = ram_ptr(n, r[d->rs] + (uint64_t)(int64_t)d->imm, 2))) return exec_one(n, d->raw);
+               n64_wbe16(p, (uint16_t)r[d->rt]); break;
+    case 0x2B: if (!(p = ram_ptr(n, r[d->rs] + (uint64_t)(int64_t)d->imm, 4))) return exec_one(n, d->raw);
+               n64_wbe32(p, (uint32_t)r[d->rt]); break;
+    case 0x3F: if (!(p = ram_ptr(n, r[d->rs] + (uint64_t)(int64_t)d->imm, 8))) return exec_one(n, d->raw);
+               n64_wbe32(p, (uint32_t)(r[d->rt] >> 32)); n64_wbe32(p + 4, (uint32_t)r[d->rt]); break;
+    default: return exec_one(n, d->raw);
+    }
+    r[0] = 0;
+    return 0;
+}
+
+/* Exact idle-loop fast-forward. Two patterns at pc (plain RDRAM, KSEG0/1):
+ *   3-instruction poll              2-instruction spin
+ *     A:   LW   rt, off(rs)           A:   BEQ/BNE x, y, A
+ *     A+4: BEQ/BNE x, y, A            A+4: NOP
+ *     A+8: NOP
+ * (LW: rt != 0, rt != rs, address = plain RDRAM word; the branch must be
+ * taken with the current/just-loaded values.) While it spins the only
+ * architectural changes are Count, Random, instret and frame_instr; rt is
+ * reloaded with the same word (nothing else writes RDRAM inside Phase 0).
+ * The skip is refused if an interrupt is deliverable now, and is cut so that
+ * Count never reaches Compare inside the skipped range: the instruction that
+ * raises IP7 runs through the normal path. Returns instructions accounted
+ * (a multiple of the loop length) or 0. */
+static uint32_t idle_skip(hs_n64_t *n, uint32_t budget)
+{
+    n64_cpu_t *c = &n->cpu;
+    uint32_t va = (uint32_t)c->pc, pa = va & 0x1FFFFFFFu, i0, ib, len, rt0 = 0, rs1, rt1, wired, rnd, cnt, dcmp, m, nins, L, idx;
+    uint64_t st, val = 0, x, y;
+    int taken;
+    if (c->next_delay || c->npc != c->pc + 4u) return 0;
+    if ((va & 0xC0000003u) != 0x80000000u || pa + 12u > n->rdram_size) return 0;
+    i0 = n64_be32(n->rdram + pa);
+    if ((i0 >> 26) == 0x23u) {
+        uint32_t rs0 = (i0 >> 21) & 31u;
+        const uint8_t *p;
+        len = 3u; ib = n64_be32(n->rdram + pa + 4u);
+        if (n64_be32(n->rdram + pa + 8u) != 0u || (ib & 0xFFFFu) != 0xFFFEu) return 0;
+        rt0 = (i0 >> 16) & 31u;
+        if (rt0 == 0u || rt0 == rs0) return 0;
+        p = ram_ptr(n, c->gpr[rs0] + (uint64_t)(int64_t)(int16_t)(uint16_t)i0, 4);
+        if (!p) return 0;
+        val = SX32(n64_be32(p));
+    } else {
+        len = 2u; ib = i0;
+        if (n64_be32(n->rdram + pa + 4u) != 0u || (ib & 0xFFFFu) != 0xFFFFu) return 0;
+    }
+    if ((ib >> 26) != 0x04u && (ib >> 26) != 0x05u) return 0;
+    rs1 = (ib >> 21) & 31u; rt1 = (ib >> 16) & 31u;
+    x = (len == 3u && rs1 == rt0) ? val : c->gpr[rs1];
+    y = (len == 3u && rt1 == rt0) ? val : c->gpr[rt1];
+    taken = (x == y);
+    if ((ib >> 26) == 0x05u) taken = !taken;
+    if (!taken) return 0;
+    st = c->cp0[C0_STATUS];
+    if ((c->cp0[C0_CAUSE] & st & 0xFF00u) && (st & ST_IE) && !(st & (ST_EXL | ST_ERL))) return 0;
+    if (c->cp0[C0_WIRED] > 31u || c->cp0[C0_RANDOM] > 31u) return 0;
+    wired = (uint32_t)c->cp0[C0_WIRED]; rnd = (uint32_t)c->cp0[C0_RANDOM];
+    if (rnd < wired) return 0;
+    cnt = (uint32_t)c->cp0[C0_COUNT];
+    dcmp = (uint32_t)c->cp0[C0_COMPARE] - cnt;      /* Count == Compare after dcmp increments (0: 2^32) */
+    m = budget / len;
+    if (dcmp != 0u && (uint64_t)m * len >= dcmp) m = (dcmp - 1u) / len;
+    if (m == 0u) return 0;
+    nins = m * len;
+    c->cp0[C0_COUNT] = (uint32_t)(cnt + nins);
+    L = 32u - wired; idx = 31u - rnd;               /* Random walks 31..wired cyclically */
+    idx = (uint32_t)(((uint64_t)idx + nins) % L);
+    c->cp0[C0_RANDOM] = 31u - idx;
+    c->instret += nins;
+    n->frame_instr += nins;
+    if (len == 3u) c->gpr[rt0] = val;
+    c->exc = 0;
+    c->in_delay = 1;                                 /* last executed: the delay-slot NOP */
+    return nins;
+}
+
 /* ------------------------------------------------------------- run */
 void n64_cpu_run(hs_n64_t *n, uint32_t instrs)
 {
     n64_cpu_t *c = &n->cpu;
-    uint32_t k;
-    for (k = 0; k < instrs; k++) {
-        uint64_t st, w;
-        uint32_t cnt = (uint32_t)c->cp0[C0_COUNT] + 1u;
+    uint32_t k = 0;
+    const int ref = (n->cfg_flags & HS_N64_CFG_REF_INTERP) != 0;
+    uint64_t idle_pc = 1u;                           /* odd: never a valid pc */
+    while (k < instrs) {
+        uint64_t st, w, pc0;
+        uint32_t cnt, ins;
+        const n64_decoded_t *d;
+        if (c->pc == idle_pc && !ref) {
+            uint32_t sk = idle_skip(n, instrs - k);
+            if (sk) { k += sk; continue; }
+        }
+        k++;
+        cnt = (uint32_t)c->cp0[C0_COUNT] + 1u;
         c->cp0[C0_COUNT] = cnt;
         if (cnt == (uint32_t)c->cp0[C0_COMPARE]) c->cp0[C0_CAUSE] |= 0x8000u;
         if (c->cp0[C0_RANDOM] <= c->cp0[C0_WIRED]) c->cp0[C0_RANDOM] = 31u;
@@ -650,8 +845,21 @@ void n64_cpu_run(hs_n64_t *n, uint32_t instrs)
             continue;
         }
         c->next_delay = 0;
-        if (!vload(n, c->pc, 4, &w)) continue;
-        if (exec_one(n, (uint32_t)w)) continue;
+        if (ref) {
+            if (!vload(n, c->pc, 4, &w)) continue;
+            if (exec_one(n, (uint32_t)w)) continue;
+        } else {
+            if (!fetch_fast(n, c->pc, &ins)) continue;
+            d = decode_cached(n, ins);
+            pc0 = c->pc;
+            if (exec_decoded(n, d)) {
+                if (d->op == 0x04u || d->op == 0x05u) {
+                    if (d->imm == -2) idle_pc = pc0 - 4u;
+                    else if (d->imm == -1) idle_pc = pc0;
+                }
+                continue;
+            }
+        }
         c->pc = c->npc;
         c->npc = c->pc + 4u;
     }

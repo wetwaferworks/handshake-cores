@@ -194,3 +194,146 @@ The PNG/WAV sha256 values are in `build/logs/sha256_outputs.txt`.
   and tested, but no Panfrost backend is included or measured here. Software 1x/FXAA are the real-time modes.
 * The 3-core figure is a computed bound (the maximum of the measured phase times). This test harness does not spawn
   threads.
+
+---
+
+## 2026-11-20 performance + compatibility round (v5.4 target)
+
+All numbers below are from TheWorkstation (WSL Ubuntu 24.04, HC v0.1.4, `./build.sh && ./run-tests.sh`,
+log `build/work/v3_tests.txt`). The baseline is `build/work/baseline_logs` (same machine, same day, 12:27 ET,
+before any change). aarch64 numbers are **emulated** (qemu-aarch64-static, `-cpu cortex-a53`). They are not
+RG35XX numbers, and no real-A53 figure is claimed. Another worker was building v5.3 on the same machine during
+part of the day, so expect a few % of timing noise.
+
+### Build / audit / tests
+
+* HC 0.1.4: 30/30 objects pass `--audit-elf`. 0 banned lock/thread/clock/rng symbols in 26 component objects.
+  0 mutable `.data/.bss` symbols in core objects. No ctor sections. Runtime-profile TUs: `tests/hs_test_host.c`
+  (timer, unchanged) and the new `src/n64_pf_sys.c` (open/ioctl/mmap for the on-device GPU probe only; the core
+  and the tests never link it).
+* Tests: **307/307 on x86_64 and 307/307 on aarch64**. The original 282 still pass, plus 25 new: 8 fast-path
+  equivalence, 6 Panfrost, 11 compatibility.
+* Cross-arch: 11/11 HASH lines identical, 7/7 output files byte-identical. The new RDP fuzz stream hash
+  `3e7014d0970fd800` is the same on both arches (the fuzz generator used to draw random numbers in unsequenced
+  operand order, so x86 and ARM fuzzed different scenes; now fixed).
+
+### Hashes (before = after, unchanged)
+
+| hash | value |
+|---|---|
+| fpu_stress | 46ab9e1e729b89df |
+| demo_video_rolling | 62bb682c7e05182a |
+| demo_video_last | 1d19341f7c7c4cb4 |
+| demo_audio_last | 462876b2151a89dd |
+| demo_pcm48k_all | bbbabb79b841507f |
+| demo_cpu_state | 7bf5474f4b4dc113 |
+| demo_fb_1x / fxaa / 2x / 4x / 8x | 48cc0825b4d2c846 / 0df142f8f60deaa3 / 5afa4531b1ce55f7 / 4ccc5486c67bd4ff / f1b261dc55a015c3 |
+
+### Per-phase times, ms per frame (demo ROM, 90 frames, `TIME` lines)
+
+| phase | x86_64 before | x86_64 after | aarch64 emulated before | aarch64 emulated after |
+|---|---|---|---|---|
+| Phase 0 CPU + RSP HLE | 3.215 | **0.035** | 23.910 | **0.231** |
+| Phase 1 render 1x | 13.812 | **9.868** | 135.912 | **54.871** |
+| Phase 1 FXAA | 17.013 | 13.319 | 172.342 | 68.629 |
+| Phase 1 2x | 60.193 | 45.328 | 565.263 | 219.938 |
+| Phase 1 4x | 227.114 | 190.633 | 2194.225 | 842.097 |
+| Phase 1 8x | 872.976 | 636.356 | 8690.311 | 3358.129 |
+| sequential 1x (all phases, 1 core) | 17.029 | **9.792** | 159.834 | **61.057** |
+
+`bench_n64` (min of 3 x 90 frames):
+
+* **Phase 0, fast vs reference interpreter:** x86 0.035 vs 5.436 ms; emulated 0.215 vs 52.002 ms.
+* **Render 1x, fast vs reference RDP:** x86 10.035 vs 15.154 ms; emulated 51.405 vs 112.310 ms.
+* **1x split in 3 strip-interleaved slices:** x86 3.302 / 3.261 / 3.506 ms; emulated 16.971 / 16.889 / 17.871 ms.
+  The slices output is bit-identical to the whole frame (`SLICES==WHOLE`).
+* **Computed 4-core pipelined bound (not measured; no threads in the harness):** Phase 0 runs on one core and the
+  three render slices run on the other three. The bound is max(0.215, 17.871) = **17.9 ms per frame emulated**
+  for the demo.
+* **Fully busy CPU frame** (781,250 instructions of a branchy ALU/load/store loop, no idle skipping):
+  x86 2.61 ms fast vs 5.12 ms reference; emulated 26.7 ms fast vs 50.1 ms reference. Final state is identical
+  (`FAST==REF`). This is the number that matters for commercial games. See the compatibility gaps.
+
+### What changed (all exact; reference paths kept behind `HS_N64_CFG_REF_INTERP` / `HS_N64_CFG_REF_RDP`)
+
+**CPU (`src/n64_cpu.c`)**
+* KSEG0/KSEG1 fetch fast path.
+* 2048-entry predecoded instruction cache, validated by the raw word, so self-modifying code is safe.
+* Fast executor for the common ALU, branch and load/store ops on plain RDRAM; everything else uses the
+  original interpreter.
+* Exact idle fast-forward for LW-poll and branch-to-self loops. It never skips past a Count==Compare match;
+  Random is advanced in closed form.
+
+**RDP (`src/n64_rdp.c`)**
+* Exact per-row spans from the edge functions (floor division) instead of per-pixel edge tests.
+* Combiner selectors precomputed into offsets.
+* Per-format texel fetch functions, with a TLUT palette cache.
+* Constant-q shift path for non-perspective triangles.
+* Texture-rectangle column stepping by exact quotient/remainder.
+* In-place 1x rendering.
+* Strip-interleaved slice API: `hs_n64_render_slice_ctx`, with per-slice scratch from `hs_n64_slice_size()`.
+* **Bug fix in the original texture-rectangle path:** a flipped rectangle leaked the swapped dx into later pixels.
+  No existing test or hash exercised it; the fuzz test found it. The fast and reference paths agree on
+  160 random scenes.
+
+**Compatibility (`src/n64_rsp.c`, new `src/n64_save.c`, `src/n64_bus.c`, `src/hs_n64.c`)**
+* Microcode identification from the OSTask `ucode_data` banner.
+* F3DEX2 / F3DZEX display-list decoder.
+* Safe skip of Nintendo-ABI audio tasks.
+* Save memory: EEPROM 4K/16K, SRAM, FlashRAM, with persistence and `save_sram`/`load_sram`.
+* Controller pak with data CRC.
+* Header-ID save-type table (SM / ZL / ZS) and automatic Expansion Pak for MM.
+* CIC identification (IPL3 CRC-32) with per-CIC seed, entry offset and header checksum.
+* Details and the ranked gap list are in `docs/N64_COMPAT.md`.
+
+**GPU (`src/n64_pf.[ch]`, `src/n64_pf_sys.c`, `tools/hs_pf_probe.c`, `docs/PANFROST_PLAN.md`)**
+* Panfrost UAPI with size asserts.
+* Device probe and BO helpers.
+* 64-bit job descriptor and WRITE_VALUE encoders.
+* A GPU fill made of a chain of WRITE_VALUE jobs, with completion and full read-back checks.
+* An in-process mock Panfrost device.
+* RDP->GPU batch builder: demo frame 96 prims -> 6 draws, 297 vertices, 4 TMEM images.
+* Status: validated on the mock only. On WSL, `hs_pf_probe` reports `cannot open device`, which is expected.
+  **Nothing has run on a Mali GPU.** The plan lists what the RG35XX must confirm, and the clean-room question
+  about descriptor layouts that only the owner can decide. No GPU speedup is claimed.
+
+**Tools / tests**
+* `tests/bench_n64.c`: per-phase bench and busy-CPU bench. `--rom=<own dump>` prints `COMPAT` lines for a real
+  cartridge (no ROM is bundled).
+* `tests/test_hs_n64.c`: `test_fastpath`, `test_panfrost`, `test_compat`; the fuzz generator is now
+  order-independent.
+* `build.sh` / `run-tests.sh`: new TUs, a TMPDIR inside the tree, bench + probe runs.
+
+### Files changed (lines now / before)
+
+| File | Lines now / before |
+|---|---|
+| src/n64_cpu.c | 866 / 658 |
+| src/n64_rdp.c | 1405 / 786 |
+| src/n64_rsp.c | 912 / 724 |
+| src/n64_bus.c | 459 / 433 |
+| src/hs_n64.c | 179 / 158 |
+| src/n64_internal.h | 332 / 270 |
+| include/hs_n64.h | 89 / 73 |
+| tests/test_hs_n64.c | 1914 / 1407 |
+| build.sh | 81 / 72 |
+| run-tests.sh | 38 / 27 |
+
+New files: src/n64_save.c 251, src/n64_pf.c 423, src/n64_pf.h 161, src/n64_pf_sys.c 49, tools/hs_pf_probe.c 51,
+tests/bench_n64.c 169, docs/PANFROST_PLAN.md, docs/N64_COMPAT.md. Shared `hs-cores/include` and `hs-cores/common`
+are unchanged.
+
+### Still open (short; full ranked list in docs/N64_COMPAT.md)
+
+1. **Real-A53 measurement.** Run `build/aarch64/bench_n64` and `build/aarch64/hs_pf_probe` on the RG35XX.
+   The commercial-game CPU budget is the busy-frame figure, 26.7 ms emulated per 60 Hz frame. A 30 fps game needs
+   two of those per displayed frame.
+2. **Audio microcode HLE** for SM64 / Zelda (currently silent).
+3. **RDRAM framebuffer / Z write-back** for Zelda effects and render-to-texture.
+4. **S2DEX** for OoT pre-rendered backgrounds.
+5. **RDP:** LOD/mipmap, key, YUV, coverage/dither.
+6. **F3DEX2 leftovers:** MODIFYVTX, MV_MATRIX, exact BRANCH_Z, point lights.
+7. **RSP vector unit** (LLE fallback).
+8. **6105 boot side effects.**
+9. **Analog input** (the device has a d-pad only).
+10. **PAL.**

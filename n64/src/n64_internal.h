@@ -72,6 +72,13 @@ typedef struct n64_tlb_entry {
     uint64_t lo0, lo1;
 } n64_tlb_entry_t;
 
+typedef struct n64_decoded {
+    uint32_t raw;
+    uint8_t op, rs, rt, rd, sa, fn, valid, pad;
+    int32_t imm;
+} n64_decoded_t;
+#define N64_DECODE_ENTRIES 2048u
+
 typedef struct n64_cpu {
     uint64_t gpr[32];
     uint64_t hi, lo;
@@ -182,6 +189,44 @@ typedef struct n64_video {
     uint32_t prims_drawn;
 } n64_video_t;
 
+/* caller-owned scratch for hs_n64_render_slice_ctx (one per rendering core) */
+typedef struct n64_slice_scratch {
+    uint32_t strip[HS_SSAA_STRIP_BUDGET / 4u];
+    uint16_t zstrip[HS_SSAA_STRIP_BUDGET / 4u];
+    n64_rstate_t rs;
+    uint64_t samples;
+    uint32_t prims;
+    uint32_t pad;
+} n64_slice_scratch_t;
+
+/* cartridge save memory + controller pak (n64_save.c) */
+enum { N64_SAVE_NONE = 0, N64_SAVE_EEP4K = 1, N64_SAVE_EEP16K = 2, N64_SAVE_SRAM = 3, N64_SAVE_FLASH = 4 };
+#define N64_SAVE_MAX   131072u
+#define N64_PAK_SIZE   32768u
+enum { N64_CIC_6101 = 6101, N64_CIC_6102 = 6102, N64_CIC_6103 = 6103, N64_CIC_6105 = 6105, N64_CIC_6106 = 6106 };
+typedef struct n64_save {
+    uint32_t type, size;     /* N64_SAVE_* and bytes */
+    uint32_t dirty;          /* bumped on every write; the frontend flushes when it changes */
+    uint32_t writes;
+    uint32_t fl_mode;        /* FlashRAM: 0 idle, 1 status, 2 ID, 3 read, 4 page-buffer write, 5 erase armed */
+    uint32_t fl_erase_off, fl_erase_len;
+    uint32_t pak_on, pak_dirty;
+    uint32_t cic, cic_known; /* IPL3 identity, from the CRC32 of ROM 0x40..0xFFF */
+    uint32_t pad;
+    uint64_t fl_status;
+    uint8_t  fl_buf[128];
+    uint8_t  data[N64_SAVE_MAX];
+    uint8_t  pak[N64_PAK_SIZE];
+} n64_save_t;
+
+enum { N64_UC_HS = 0, N64_UC_FAST3D = 1, N64_UC_F3DEX = 2, N64_UC_F3DEX2 = 3, N64_UC_S2DEX = 4, N64_UC_UNKNOWN_GFX = 5 };
+typedef struct n64_ucinfo {
+    uint32_t addr, valid, kind, detects, hits;
+    uint32_t unhandled;      /* F3DEX2 commands seen but not implemented */
+    uint32_t unknown_tasks;  /* gfx tasks with an unrecognised microcode */
+    uint32_t audio_skipped;  /* audio tasks with a Nintendo ABI microcode */
+} n64_ucinfo_t;
+
 typedef struct n64_audio {
     uint32_t phase;          /* 16.16 position within the current source frame */
     int16_t  last_l, last_r;
@@ -199,6 +244,7 @@ typedef struct hs_n64 {
     uint32_t input;
     uint32_t cfg_flags;
     n64_cpu_t cpu;
+    n64_decoded_t decoded[N64_DECODE_ENTRIES];
     /* bus registers */
     uint32_t mi_mode, mi_intr, mi_mask;
     uint32_t vi_reg[14];
@@ -216,7 +262,9 @@ typedef struct hs_n64 {
     n64_snap_t snap[2];
     n64_video_t video;
     n64_audio_t audio;
+    n64_ucinfo_t ucinfo;
     uint8_t  rdram[N64_RDRAM_MAX];
+    n64_save_t save;         /* cartridge save + controller pak: survives reset */
 } hs_n64_t;
 
 #define N64_MAGIC 0x4E363421u
@@ -240,6 +288,7 @@ uint32_t n64_fpu_round_w(double v, uint32_t rm, int32_t *out);  /* returns 1 if 
 uint32_t n64_phys_read32(hs_n64_t *n, uint32_t pa);
 void     n64_phys_write32(hs_n64_t *n, uint32_t pa, uint32_t v, uint32_t mask);
 int      n64_rom_load(hs_n64_t *n, const uint8_t *rom, size_t len);
+uint32_t n64_rom_word(const hs_n64_t *n, uint32_t off);   /* big-endian word through the byte-order view */
 void     n64_rom_crc(const uint8_t *z64, size_t len, uint32_t *crc1, uint32_t *crc2);
 int      n64_rom_detect_swap(const uint8_t *rom, size_t len); /* 0 z64, 1 v64, 2 n64, -1 */
 void     n64_pif_boot(hs_n64_t *n);
@@ -251,6 +300,19 @@ void     n64_vi_frame_start(hs_n64_t *n);
 void     n64_rsp_start(hs_n64_t *n);
 void     n64_rdp_ingest(hs_n64_t *n, const uint32_t *w, uint32_t nwords);
 void     n64_dp_run(hs_n64_t *n);
+/* n64_save.c */
+void     n64_save_setup(hs_n64_t *n);               /* pick the save type for the loaded ROM */
+uint32_t n64_rom_crc32(const hs_n64_t *n, uint32_t from, uint32_t to);   /* CRC-32 (IEEE) of ROM bytes */
+uint32_t n64_cic_detect(const hs_n64_t *n, uint32_t *crc32_out);
+void     n64_rom_crc_cic(const hs_n64_t *n, uint32_t cic, uint32_t *crc1, uint32_t *crc2);
+int      n64_save_joybus(hs_n64_t *n, uint32_t ch, const uint8_t *cmd, uint32_t tx, uint8_t *res, uint32_t rx);
+int      n64_pak_cmd(hs_n64_t *n, const uint8_t *cmd, uint32_t tx, uint8_t *res, uint32_t rx);
+uint8_t  n64_pak_crc8(const uint8_t *d, uint32_t len);
+uint32_t n64_cart2_read32(hs_n64_t *n, uint32_t pa);
+void     n64_cart2_write32(hs_n64_t *n, uint32_t pa, uint32_t v);
+void     n64_cart2_dma_read(hs_n64_t *n, uint32_t cart, uint8_t *dst, uint32_t len);   /* cart -> RDRAM */
+void     n64_cart2_dma_write(hs_n64_t *n, uint32_t cart, const uint8_t *src, uint32_t len); /* RDRAM -> cart */
+uint32_t n64_ucode_classify(const uint8_t *data, uint32_t len);
 void     n64_rsp_matmul(const int32_t *a, const int32_t *b, int32_t *out);
 void     n64_rsp_load_mtx(const uint8_t *src, int32_t *out);
 void     n64_rsp_xform(const int32_t *m, int32_t x, int32_t y, int32_t z, int32_t *out4);

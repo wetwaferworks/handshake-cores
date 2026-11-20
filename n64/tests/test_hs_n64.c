@@ -13,6 +13,7 @@
 #include <string.h>
 #include "hs_test.h"
 #include "../src/n64_internal.h"
+#include "../src/n64_pf.h"
 
 static hs_tstats_t TS;
 static hs_n64_t *N;
@@ -1370,6 +1371,509 @@ static void test_demo_rom(void)
     free(pcm_all);
 }
 
+/* ======================================================= fast paths == reference
+ * Added with the v0.2 speed work. The decode-cache interpreter, the exact
+ * idle-loop fast-forward and the fast RDP path must reproduce the reference
+ * paths bit for bit (HS_N64_CFG_REF_INTERP / HS_N64_CFG_REF_RDP). */
+static uint32_t fz_state;
+static uint32_t fz(void) { fz_state = fz_state * 1664525u + 1013904223u; return fz_state >> 8; }
+
+typedef struct cpu_ck { n64_cpu_t cpu; uint32_t frame_instr; uint64_t ram; } cpu_ck_t;
+
+static void idle_prog(uint32_t wired)
+{
+    cpu_setup(0x8001u);                     /* IE + IM7, EXL/ERL/BEV clear */
+    at(0x180u);
+    P(LUI(K0, 0x8000)); P(LW(K1, 0x2000, K0)); P(ADDIU(K1, K1, 1)); P(SW(K1, 0x2000, K0));
+    P(MFC0(K1, C0_COMPARE)); P(ADDIU(K1, K1, 997)); P(MTC0(K1, C0_COMPARE)); P(ERET);
+    at(0x1000u);
+    P(LUI(S0, 0x8000)); LI(T0, 500); P(MTC0(T0, C0_COMPARE)); LI(T0, wired); P(MTC0(T0, C0_WIRED));
+    LI(T3, 10);
+    P(LW(T1, 0x2000, S0)); P(BNE(T1, T3, -2)); P(NOP);          /* poll until 10 interrupts */
+    P(ADDIU(T4, T4, 1));
+    P(LW(T2, 0x2004, S0)); P(BEQ(T2, 0, -2)); P(NOP);           /* poll forever (word stays 0) */
+    HALT();
+}
+
+static uint32_t idle_run(uint32_t flags, uint32_t wired, cpu_ck_t *ck, uint32_t nck)
+{
+    static const uint32_t chunk[8] = { 1, 2, 3, 7, 64, 1000, 4093, 25013 };
+    uint32_t i;
+    N->cfg_flags = flags;
+    idle_prog(wired);
+    for (i = 0; i < nck; i++) {
+        run(chunk[i % 8u]);
+        ck[i].cpu = N->cpu; ck[i].frame_instr = N->frame_instr;
+        ck[i].ram = hs_fnv1a64(HS_FNV64_OFFSET, N->rdram, 0x3000u);
+    }
+    N->cfg_flags = 0;
+    return (uint32_t)n64_be32(N->rdram + 0x2000u);
+}
+
+static void fz_scene(uint32_t seed)
+{
+    uint32_t k, nprim;
+    uint8_t texb[512];
+    fz_state = seed * 2654435761u + 1u;
+    rdp_begin();
+    rdp_targets();
+    om(0x300000u, 0); RP(0x37000000u, fz() & 0xFFFFFFFFu); rect36(0, 0, 319, 239);
+    RP(0x3F180000u | 319u, 0x380000u);                          /* Z clear through a Z-target fill */
+    om(0x300000u, 0); RP(0x37000000u, 0xFFFCFFFCu); rect36(0, 0, 319, 239);
+    RP(0x3F180000u | 319u, 0x300000u);
+    for (k = 0; k < sizeof(texb); k++) texb[k] = (uint8_t)fz();
+    nprim = 6u + fz() % 10u;
+    for (k = 0; k < nprim; k++) {
+        /* every draw is taken in its own statement (or a fixed q[] slot), so the
+         * scene stream is identical whatever order a compiler evaluates operands in */
+        uint32_t fmt = fz() % 5u, siz = fz() % 4u, cyc = fz() % 4u, kind = fz() % 8u, flags, t, j, q[24];
+        uint32_t lo = fz(), hi;
+        for (j = 0; j < 24u; j++) q[j] = fz();
+        if (fmt == 1u) fmt = 3u;
+        hi = (cyc << 20) | ((q[0] & 1u) << 19) | ((q[1] % 4u) << 12) | ((q[2] & 3u) << 14);
+        if (k == 0u) { timg(0, 2, 16, texb, 32); settile(7, 0, 2, 4, 0x100, 0); loadblock(7, 16); } /* TLUT at 0x800 */
+        RP(0xF5000000u | (fmt << 21) | (siz << 19) | ((1u + q[3] % 4u) << 9) | (q[4] % 64u), (q[5] & 0x00FFFFFFu) & ~0x07000000u);
+        RP(0xF5000000u | (fmt << 21) | (siz << 19) | (2u << 9) | 32u, 0x01000000u | (q[6] & 0x00FFFFFFu));
+        timg(fmt, siz, 16, texb + (q[7] % 128u), 256);
+        loadblock(0, 64);
+        RP(0xF2000000u | ((q[8] % 64u) << 12) | (q[9] % 64u), ((q[10] % 256u) << 12) | (q[11] % 256u));
+        RP(0xFC000000u | (q[12] & 0x00FFFFFFu), q[13] ^ (q[14] << 8));
+        RP(0xFA000000u | (q[15] & 0xFFu), q[16] ^ (q[17] << 8));
+        RP(0xFB000000u, q[18] ^ (q[19] << 8));
+        RP(0xF8000000u, q[20] ^ (q[21] << 8));
+        RP(0xF9000000u, q[22] ^ (q[23] << 8));
+        for (j = 0; j < 24u; j++) q[j] = fz();
+        RP(0xEE000000u, q[0] << 8);
+        om(hi, (lo << 8) ^ q[1]);
+        if (q[2] % 6u == 0u) scissor(q[3] % 100u, q[4] % 80u, 160u + q[5] % 160u, 120u + q[6] % 120u);
+        if (kind < 5u) {
+            flags = N64_TRI_SHADE | ((q[7] & 1u) ? N64_TRI_Z : 0u) | ((q[8] % 3u) ? N64_TRI_TEX : 0u);
+            RB->rdp[RB->rdp_n++] = (N64_OP_HS_TRI << 24) | ((q[9] % 8u) << 8) | flags;
+            for (t = 0; t < 3u; t++) {
+                for (j = 0; j < 11u; j++) q[j] = fz();
+                RB->rdp[RB->rdp_n++] = (uint32_t)((int32_t)(q[0] % 420u) - 50) << 16 | (q[1] & 0xFFFFu);
+                RB->rdp[RB->rdp_n++] = (uint32_t)((int32_t)(q[2] % 330u) - 45) << 16 | (q[3] & 0xFFFFu);
+                RB->rdp[RB->rdp_n++] = q[4] & 0xFFFFu;
+                RB->rdp[RB->rdp_n++] = 0x8000u + (q[5] % 0x60000u);
+                RB->rdp[RB->rdp_n++] = (uint32_t)((int32_t)(q[6] % 4096u) - 1024) << 12;
+                RB->rdp[RB->rdp_n++] = (uint32_t)((int32_t)(q[7] % 4096u) - 1024) << 12;
+                RB->rdp[RB->rdp_n++] = q[8] ^ (q[9] << 8);
+            }
+        } else if (kind < 7u) {
+            uint32_t x0 = q[10] % 300u, y0 = q[11] % 220u;
+            RP4(((kind == 5u) ? 0xE4000000u : 0xE5000000u) | (((x0 + 4u + q[12] % 120u) << 2) << 12) | ((y0 + 2u + q[13] % 60u) << 2),
+                ((q[14] % 8u) << 24) | ((x0 << 2) << 12) | (y0 << 2), q[15], (q[16] & 0xFFFFu) | ((q[17] & 0x3FFFu) << 16));
+        } else {
+            uint32_t x0 = q[10] % 300u, y0 = q[11] % 220u;
+            RP(0x36000000u | (((x0 + q[12] % 100u) << 2) << 12) | ((y0 + q[13] % 60u) << 2), ((x0 << 2) << 12) | (y0 << 2));
+        }
+    }
+    N->front ^= 1u;
+}
+
+static void test_fastpath(void)
+{
+    static const hs_video_mode_t modes[5] = { HS_SSAA_1X, HS_AA_FXAA, HS_SSAA_2X, HS_SSAA_4X, HS_SSAA_8X };
+    hs_n64_t *A = N, *B;
+    cpu_ck_t *ca, *cb;
+    const uint32_t nck = 64u, frames = 90u, scenes = QUICK ? 40u : 160u;
+    uint32_t i, f, w, m, bad = 0, badfb = 0, badsl = 0, badm = 0, badsc = 0, cnt_a, cnt_b, wireds[3] = { 0, 5, 31 };
+    void *scratch[HS_N64_MAX_SLICES];
+    uint64_t fzh = HS_FNV64_OFFSET;
+    printf("[fastpath] decode cache + idle fast-forward + fast RDP == reference paths\n");
+    ca = (cpu_ck_t *)calloc(nck, sizeof(cpu_ck_t)); cb = (cpu_ck_t *)calloc(nck, sizeof(cpu_ck_t));
+    B = (hs_n64_t *)aligned_alloc(64, (sizeof(hs_n64_t) + 63u) & ~(size_t)63u);
+    for (i = 0; i < HS_N64_MAX_SLICES; i++) scratch[i] = aligned_alloc(64, (hs_n64_slice_size() + 63u) & ~(size_t)63u);
+    if (!ca || !cb || !B || !scratch[0] || !scratch[1] || !scratch[2] || !scratch[3]) { HS_CHECK(&TS, 0, "alloc"); return; }
+    /* 1. synthetic idle loops with Count/Compare interrupts, odd run chunks */
+    for (w = 0; w < 3u; w++) {
+        uint32_t diff = 0;
+        core_init(N, 0);
+        cnt_a = idle_run(HS_N64_CFG_REF_INTERP, wireds[w], ca, nck);
+        core_init(N, 0);
+        cnt_b = idle_run(0u, wireds[w], cb, nck);
+        for (i = 0; i < nck; i++)
+            if (memcmp(&ca[i].cpu, &cb[i].cpu, sizeof(n64_cpu_t)) != 0 || ca[i].frame_instr != cb[i].frame_instr || ca[i].ram != cb[i].ram) diff++;
+        HS_CHECK(&TS, diff == 0u && cnt_a == cnt_b && cnt_a > 10u && ca[nck - 1u].cpu.gpr[T4] == 1u,
+                 "idle fast-forward == reference: Wired=%u, %u checkpoints, %u interrupts, 0 diffs (%u)", wireds[w], nck, cnt_a, diff);
+    }
+    /* 2. demo ROM: reference interpreter+RDP vs fast paths, every frame */
+    core_init(A, HS_N64_CFG_REF_INTERP | HS_N64_CFG_REF_RDP); core_init(B, 0);
+    hs_n64_core_ops.load_rom(A, ROM, ROMLEN); hs_n64_core_ops.load_rom(B, ROM, ROMLEN);
+    for (f = 0; f < frames; f++) {
+        uint64_t va, vb, aa, ab;
+        hs_n64_core_ops.step_cpu_phase(A, 0, 0); hs_n64_core_ops.step_cpu_phase(B, 0, 0);
+        hs_n64_core_ops.commit_phase(A); hs_n64_core_ops.commit_phase(B);
+        hs_n64_core_ops.hash_state(A, &va, &aa); hs_n64_core_ops.hash_state(B, &vb, &ab);
+        if (memcmp(&A->cpu, &B->cpu, sizeof(n64_cpu_t)) != 0 || A->frame_instr != B->frame_instr ||
+            n64_cpu_state_hash(A) != n64_cpu_state_hash(B) || va != vb || aa != ab) bad++;
+        hs_n64_core_ops.render_video_phase(A, FB, HS_FB_W, HS_SSAA_1X);
+        hs_n64_core_ops.render_video_phase(B, FB2, HS_FB_W, HS_SSAA_1X);
+        if (memcmp(FB, FB2, HS_FB_W * HS_FB_H * 4u) != 0) badfb++;
+        if (f % 15u == 7u) {
+            uint32_t cntsl = 1u + (f / 15u) % HS_N64_MAX_SLICES;
+            memset(FB2, 0, HS_FB_W * HS_FB_H * 4u);
+            for (i = 0; i < cntsl; i++)
+                if (hs_n64_render_slice_ctx(B, scratch[i], hs_n64_slice_size(), FB2, HS_FB_W, HS_SSAA_1X, i, cntsl) != 0) badsl++;
+            if (memcmp(FB, FB2, HS_FB_W * HS_FB_H * 4u) != 0) badsl++;
+        }
+    }
+    HS_CHECK(&TS, bad == 0u, "demo: decode-cache + idle fast-forward CPU == reference, %u frames (%u diffs)", frames, bad);
+    HS_CHECK(&TS, badfb == 0u, "demo: fast RDP 1x == reference RDP 1x, %u frames (%u diffs)", frames, badfb);
+    HS_CHECK(&TS, badsl == 0u, "demo: 1..4 strip-interleaved slices (own scratch) == whole frame (%u diffs)", badsl);
+    for (m = 1; m < (QUICK ? 3u : 5u); m++) {
+        hs_n64_core_ops.render_video_phase(A, FB, HS_FB_W, modes[m]);
+        hs_n64_core_ops.render_video_phase(B, FB2, HS_FB_W, modes[m]);
+        if (memcmp(FB, FB2, HS_FB_W * HS_FB_H * 4u) != 0) badm++;
+    }
+    HS_CHECK(&TS, badm == 0u, "demo last frame: fast == reference in FXAA/2x/4x/8x (%u diffs)", badm);
+    /* 3. RDP fuzz: random combiner/blender/other modes, formats, TLUT, tris, texrects, fills */
+    for (i = 0; i < scenes; i++) {
+        hs_video_mode_t md = (i % 4u == 3u) ? HS_SSAA_2X : ((i % 4u == 2u) ? HS_AA_FXAA : HS_SSAA_1X);
+        core_init(N, (i & 1u) ? HS_N64_CFG_BILINEAR4 : 0u);
+        fz_scene(i);
+        fzh = hs_fnv1a64(fzh, n64_front(N)->rdp, (size_t)n64_front(N)->rdp_n * 4u);
+        N->cfg_flags |= HS_N64_CFG_REF_RDP;
+        rerender(md, FB);
+        N->cfg_flags &= ~HS_N64_CFG_REF_RDP;
+        rerender(md, FB2);
+        if (memcmp(FB, FB2, HS_FB_W * HS_FB_H * 4u) != 0) badsc++;
+    }
+    printf("INFO fuzz_stream_hash %016llx (must match across arches)\n", (unsigned long long)fzh);
+    HS_CHECK(&TS, badsc == 0u, "RDP fuzz: fast == reference on %u random scenes (1x/FXAA/2x, 3-point+bilinear) (%u diffs)", scenes, badsc);
+    for (i = 0; i < HS_N64_MAX_SLICES; i++) free(scratch[i]);
+    free(B); free(ca); free(cb);
+    core_init(N, 0);
+}
+
+/* ======================================================= Panfrost step 1
+ * Independent hex constants (computed by hand from the kernel UAPI:
+ * dir<<30 | size<<16 | 'd'<<8 | nr) are compared with the macro encoder. */
+static void test_panfrost(void)
+{
+    hs_pf_os_t os;
+    hs_pf_mock_t *mk;
+    hs_pf_dev_t d;
+    hs_pf_bo_t img;
+    hs_pf_fill_result_t fr;
+    uint8_t job[64];
+    uint32_t x, y, outside = 0;
+    int r;
+    printf("[panfrost] UAPI encoding, mock-device probe, WRITE_VALUE fill, RDP batch builder\n");
+    HS_CHECK(&TS, HS_DRM_IOCTL_VERSION == 0xC0406400ul && HS_DRM_IOCTL_GEM_CLOSE == 0x40086409ul &&
+                  HS_PF_IOCTL_SUBMIT == 0x40306440ul && HS_PF_IOCTL_WAIT_BO == 0x40106441ul &&
+                  HS_PF_IOCTL_CREATE_BO == 0xC0186442ul && HS_PF_IOCTL_MMAP_BO == 0xC0106443ul &&
+                  HS_PF_IOCTL_GET_PARAM == 0xC0106444ul,
+             "DRM/Panfrost ioctl numbers match the hand-computed UAPI values");
+    hs_pf_encode_job_header(job, HS_PF_JOB_WRITE_VALUE, 3u, 2u, 0x1122334455667788ull);
+    hs_pf_encode_write_value(job + 32, 0x10002000ull, HS_PF_WV_IMM64, 0xAABBCCDDEEFF0011ull);
+    HS_CHECK(&TS, job[16] == 0x05u && job[17] == 0 && job[18] == 3u && job[20] == 2u && job[24] == 0x88u && job[31] == 0x11u &&
+                  job[0] == 0 && job[32] == 0x00u && job[33] == 0x20u && job[35] == 0x10u && job[40] == 7u && job[48] == 0x11u && job[55] == 0xAAu,
+             "job header + WRITE_VALUE payload byte layout");
+    mk = (hs_pf_mock_t *)malloc(sizeof(hs_pf_mock_t));
+    if (!mk) { HS_CHECK(&TS, 0, "alloc mock"); return; }
+    hs_pf_mock_init(mk, &os, HS_PF_PROD_G31);
+    r = hs_pf_open(&d, &os, "/dev/dri/renderD128");
+    HS_CHECK(&TS, r == HS_PF_OK && d.info.is_g31 && d.info.shader_cores == 2u && strcmp(d.info.driver, "panfrost") == 0,
+             "probe on mock: driver=%s prod=0x%llx cores=%u g31=%u", d.info.driver, (unsigned long long)d.info.prod_id, d.info.shader_cores, d.info.is_g31);
+    r = hs_pf_bo_new(&d, 80u * 70u * 4u, HS_PF_BO_NOEXEC, &img);
+    if (r == HS_PF_OK) memset(img.cpu, 0x5A, img.size);
+    r = r ? r : hs_pf_fill_write_value(&d, &img, 64u, 64u, 80u, 0xFF3C8859u, &fr);
+    for (y = 0; y < 70u && r == HS_PF_OK; y++)
+        for (x = 0; x < 80u; x++)
+            if ((x >= 64u || y >= 64u) && n64_be32(img.cpu + (y * 80u + x) * 4u) != 0x5A5A5A5Au) outside++;
+    HS_CHECK(&TS, r == HS_PF_OK && fr.jobs == 2048u && fr.done_jobs == 2048u && fr.bad_pixels == 0u && outside == 0u &&
+                  mk->submits == 1u && mk->waits == 1u && mk->bad_jobs == 0u,
+             "WRITE_VALUE chain fills 64x64 in an 80-stride BO on the mock: %u jobs DONE, 0 bad pixels, 0 outside writes (r=%d out=%u)",
+             fr.done_jobs, r, outside);
+    hs_pf_bo_free(&d, &img);
+    hs_pf_close(&d);
+    hs_pf_mock_init(mk, &os, 0x0750u);          /* a Midgard T760 id */
+    r = hs_pf_open(&d, &os, "x");
+    HS_CHECK(&TS, r == HS_PF_OK && !d.info.is_g31, "probe reports non-G31 GPUs as such");
+    hs_pf_close(&d);
+    free(mk);
+    /* batch builder over the demo frame */
+    {
+        hs_pf_batch_t b;
+        hs_pf_vtx_t *vtx = (hs_pf_vtx_t *)malloc(sizeof(hs_pf_vtx_t) * 8192u);
+        hs_pf_draw_t draw[512];
+        n64_rdp_backend_t bk;
+        uint32_t prims, f, sum = 0, i, inside = 0;
+        if (!vtx) { HS_CHECK(&TS, 0, "alloc vtx"); return; }
+        core_init(N, 0);
+        hs_n64_core_ops.load_rom(N, ROM, ROMLEN);
+        for (f = 0; f < 30u; f++) { hs_n64_core_ops.step_cpu_phase(N, 0, 0); hs_n64_core_ops.commit_phase(N); }
+        hs_pf_batch_init(&b, vtx, 8192u, draw, 512u);
+        memset(&bk, 0, sizeof(bk));
+        hs_pf_batch_backend(&b, &bk);
+        prims = hs_n64_walk_backend(N, &bk, 1);
+        for (i = 0; i < b.ndraw; i++) sum += draw[i].count;
+        for (i = 0; i < b.nvtx; i++) if (vtx[i].x >= -64.0f && vtx[i].x <= 64.0f && vtx[i].y >= -64.0f && vtx[i].y <= 64.0f && vtx[i].rhw > 0.0f) inside++;   /* finite, guard band */
+        printf("INFO pf_batch prims=%u draws=%u vertices=%u textures=%u fills=%u texrects=%u ntris=%u inside=%u sum=%u\n", prims, b.ndraw, b.nvtx, b.ntmem, b.fills, b.texrects, n64_front(N)->ntris, inside, sum);
+        HS_CHECK(&TS, b.overflow == 0u && b.fills == 2u && b.texrects == 1u && sum == b.nvtx &&
+                      b.nvtx == 3u * n64_front(N)->ntris + 6u * 3u && b.ndraw >= 2u && b.ndraw < prims && inside == b.nvtx,
+                 "RDP->GPU batch: %u prims -> %u draws, %u vertices, %u TMEM uploads", prims, b.ndraw, b.nvtx, b.ntmem);
+        free(vtx);
+        core_init(N, 0);
+    }
+}
+
+/* ===================================================== commercial-title compat
+ * Synthetic checks only (no commercial ROM or microcode is in this tree):
+ * microcode banner classification, F3DEX2 decoder == F3DEX decoder on the same
+ * scene, EEPROM / SRAM / FlashRAM / controller pak protocols, CIC handling. */
+static void put16(uint32_t a, uint32_t v) { n64_wbe16(N->rdram + a, (uint16_t)v); }
+static void put32(uint32_t a, uint32_t v) { n64_wbe32(N->rdram + a, v); }
+static void put_mtx(uint32_t a, const int32_t *m)
+{
+    uint32_t i;
+    for (i = 0; i < 16u; i++) { put16(a + i * 2u, (uint32_t)m[i] >> 16); put16(a + 32u + i * 2u, (uint32_t)m[i] & 0xFFFFu); }
+}
+static void put_str(uint32_t a, const char *s) { uint32_t i; for (i = 0; s[i]; i++) N->rdram[a + i] = (uint8_t)s[i]; N->rdram[a + i] = 0; }
+
+#define CA_PROJ 0x100000u
+#define CA_MV   0x100040u
+#define CA_VP   0x100080u
+#define CA_LT   0x1000A0u
+#define CA_VTX  0x100100u
+#define CA_DL   0x101000u
+#define CA_UC   0x102000u
+
+static void compat_scene_data(void)
+{
+    int32_t p[16], m[16];
+    uint32_t i;
+    static const int16_t vx[8][3] = { { -80, -60, -20 }, { 80, -60, -10 }, { 0, 70, 0 }, { -90, 50, 10 },
+                                      { 90, 55, 20 }, { -30, -80, 30 }, { 60, 0, -30 }, { -60, 10, 5 } };
+    memset(p, 0, sizeof(p)); memset(m, 0, sizeof(m));
+    p[0] = p[5] = p[10] = 0x290;  p[15] = 65536;          /* ~1/100 scale, w = 1 */
+    m[0] = m[5] = m[10] = m[15] = 65536; m[12] = 5 << 16; /* translate x by 5 */
+    put_mtx(CA_PROJ, p); put_mtx(CA_MV, m);
+    put16(CA_VP + 0, 640); put16(CA_VP + 2, 480); put16(CA_VP + 4, 511); put16(CA_VP + 6, 0);
+    put16(CA_VP + 8, 640); put16(CA_VP + 10, 480); put16(CA_VP + 12, 511); put16(CA_VP + 14, 0);
+    put32(CA_LT + 0, 0xF0C08000u); put32(CA_LT + 4, 0xF0C08000u); put32(CA_LT + 8, 0x30508000u); put32(CA_LT + 12, 0);   /* light 1 */
+    put32(CA_LT + 16, 0x20304000u); put32(CA_LT + 20, 0x20304000u); put32(CA_LT + 24, 0); put32(CA_LT + 28, 0);       /* ambient */
+    for (i = 0; i < 8u; i++) {
+        uint32_t a = CA_VTX + i * 16u;
+        put16(a, (uint16_t)vx[i][0]); put16(a + 2u, (uint16_t)vx[i][1]); put16(a + 4u, (uint16_t)vx[i][2]); put16(a + 6u, 0);
+        put16(a + 8u, i * 64u); put16(a + 10u, i * 48u);
+        put32(a + 12u, 0x40000000u ^ (i * 0x1F3D5B7Fu) ^ 0xFFu);
+    }
+}
+
+/* the same scene in two encodings; dialect 0 = F3DEX, 1 = F3DEX2 */
+static void compat_dl(int x2, int lit)
+{
+    uint32_t a = CA_DL;
+#define DL(w0, w1) do { put32(a, (w0)); put32(a + 4u, (w1)); a += 8u; } while (0)
+    DL(x2 ? 0xDA380007u : 0x01030040u, CA_PROJ);                      /* projection, load */
+    DL(x2 ? 0xDA380003u : 0x01020040u, CA_MV);                        /* modelview, load, no push */
+    DL(x2 ? 0xDC080008u : 0x03800010u, CA_VP);                        /* viewport */
+    DL(x2 ? 0xD9FFFFFFu : 0xB7000000u, x2 ? (0x1u | 0x4u | 0x200000u | 0x400u | (lit ? 0x20000u : 0u))
+                                          : (0x1u | 0x4u | 0x200u | 0x2000u | (lit ? 0x20000u : 0u)));
+    if (lit) {
+        DL(x2 ? 0xDB020000u : 0xBC000002u, x2 ? 24u : 0x80000040u);   /* one directional light */
+        DL(x2 ? 0xDC08060Au : 0x03860010u, CA_LT);                    /* light 1 */
+        DL(x2 ? 0xDC08090Au : 0x03880010u, CA_LT + 16u);              /* ambient = light 2 */
+    }
+    DL(x2 ? 0xE3000A01u : 0xBA001402u, 0x00000000u);                 /* other mode H: cycle type = 1-cycle */
+    DL(x2 ? 0xD7000002u : 0xBB000001u, 0x80008000u);                 /* texture on, tile 0, scale 0.5 */
+    DL(0xFC121824u, 0xFF33FFFFu);                                     /* RDP pass-through: combine */
+    DL(0xFA000000u, 0x80FF40C0u);                                     /* prim colour */
+    DL(x2 ? (0x01000000u | (8u << 12) | (8u << 1)) : (0x04000000u | (0u << 16) | (8u << 10) | 127u), CA_VTX);
+    DL(x2 ? 0x05000204u : 0xBF000000u, x2 ? 0u : 0x00000204u);        /* tri 0,1,2 */
+    DL(x2 ? 0x06060a08u : 0xB1060a08u, 0x000a0c0eu);                  /* tri2 (3,5,4) (0,6,7) */
+    DL(x2 ? 0xDF000000u : 0xB8000000u, 0);
+#undef DL
+}
+
+static uint32_t compat_run_gfx(const char *banner, uint64_t *h)
+{
+    n64_snap_t *b = n64_back(N);
+    b->rdp_n = 0; b->tex_n = 0; b->ntris = 0;
+    put_str(CA_UC, banner);
+    memset(N->rsp.dmem + 0xFC0u, 0, 64);
+    n64_wbe32(N->rsp.dmem + 0xFC0u, 1u);
+    n64_wbe32(N->rsp.dmem + 0xFD8u, banner[0] ? CA_UC : 0u);
+    n64_wbe32(N->rsp.dmem + 0xFDCu, 0x100u);
+    n64_wbe32(N->rsp.dmem + 0xFF0u, CA_DL);
+    N->ucinfo.valid = 0;
+    n64_rsp_start(N);
+    *h = hs_fnv1a64(HS_FNV64_OFFSET, b->rdp, (size_t)b->rdp_n * 4u);
+    return b->ntris;
+}
+
+static void pif_frame(const uint8_t *f, uint32_t len) { memset(N->pif_ram, 0, 64); memcpy(N->pif_ram, f, len); n64_pif_process(N); }
+
+static void test_compat(void)
+{
+    uint64_t h1, h2, h3;
+    uint32_t t1, t2, t3, i, ok;
+    uint8_t blk[32];
+    printf("[compat] microcode HLE dialects, cartridge saves, controller pak, CIC\n");
+    {
+        static const char *ban[6] = { "RSP SW Version: 2.0D, test", "RSP Gfx ucode F3DEX       fifo 0.95",
+                                      "RSP Gfx ucode F3DEX2.NoN fifo 2.04", "RSP Gfx ucode F3DZEX.NoN fifo 2.06H",
+                                      "RSP Gfx ucode S2DEX  fifo 1.06", "no banner here" };
+        static const uint32_t want[6] = { N64_UC_FAST3D, N64_UC_F3DEX, N64_UC_F3DEX2, N64_UC_F3DEX2, N64_UC_S2DEX, N64_UC_UNKNOWN_GFX };
+        ok = 0;
+        for (i = 0; i < 6u; i++) ok += n64_ucode_classify((const uint8_t *)ban[i], (uint32_t)strlen(ban[i])) == want[i];
+        HS_CHECK(&TS, ok == 6u, "microcode banner classifier: Fast3D / F3DEX / F3DEX2 / F3DZEX / S2DEX / unknown (%u/6)", ok);
+    }
+    core_init(N, 0);
+    compat_scene_data();
+    compat_dl(0, 0); t1 = compat_run_gfx("RSP Gfx ucode F3DEX       fifo 0.95", &h1);
+    compat_dl(0, 0); t3 = compat_run_gfx("", &h3);
+    compat_dl(1, 0); t2 = compat_run_gfx("RSP Gfx ucode F3DZEX.NoN fifo 2.06H", &h2);
+    HS_CHECK(&TS, t1 == 3u && t2 == t1 && t3 == t1 && h1 == h2 && h1 == h3 && N->ucinfo.unhandled == 0u,
+             "F3DZEX/F3DEX2 decoder emits the identical RDP stream as F3DEX for the same scene (%u tris, %016llx vs %016llx)",
+             t2, (unsigned long long)h1, (unsigned long long)h2);
+    compat_dl(0, 1); t1 = compat_run_gfx("RSP Gfx ucode F3DEX       fifo 0.95", &h1);
+    compat_dl(1, 1); t2 = compat_run_gfx("RSP Gfx ucode F3DEX2.NoN fifo 2.04", &h2);
+    HS_CHECK(&TS, t1 == t2 && t1 > 0u && h1 == h2, "F3DEX2 lighting (MOVEMEM light offsets, NUMLIGHT) == F3DEX (%u tris)", t2);
+    {
+        uint32_t na = N->ucinfo.audio_skipped;
+        uint64_t ram = hs_fnv1a64(HS_FNV64_OFFSET, N->rdram, 0x200000u);
+        memset(N->rsp.dmem + 0xFC0u, 0, 64);
+        n64_wbe32(N->rsp.dmem + 0xFC0u, 2u); n64_wbe32(N->rsp.dmem + 0xFD8u, CA_UC); n64_wbe32(N->rsp.dmem + 0xFF0u, CA_DL);
+        n64_rsp_start(N);
+        HS_CHECK(&TS, N->ucinfo.audio_skipped == na + 1u && ram == hs_fnv1a64(HS_FNV64_OFFSET, N->rdram, 0x200000u) && (N->rsp.status & 1u),
+                 "Nintendo-ABI audio task: skipped safely (RDRAM untouched, RSP halted)");
+    }
+    /* EEPROM 4K over joybus channel 4 */
+    core_init(N, HS_N64_CFG_SAVE(2));
+    N->rom_len = 0; n64_save_setup(N);
+    {
+        uint8_t st[] = { 0, 0, 0, 0, 0x01, 0x03, 0x00, 0, 0, 0, 0xFE };
+        uint8_t wr[] = { 0, 0, 0, 0, 0x0A, 0x01, 0x05, 0x07, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0xFE };
+        uint8_t rd[] = { 0, 0, 0, 0, 0x02, 0x08, 0x04, 0x07, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFE };
+        pif_frame(st, sizeof(st));
+        ok = N->pif_ram[7] == 0x00 && N->pif_ram[8] == 0x80 && N->pif_ram[9] == 0x00;
+        pif_frame(wr, sizeof(wr));
+        ok &= N->save.data[56] == 1u && N->save.data[63] == 8u && N->save.dirty == 1u;
+        pif_frame(rd, sizeof(rd));
+        ok &= N->pif_ram[8] == 1u && N->pif_ram[15] == 8u;
+        HS_CHECK(&TS, ok, "EEPROM 4 Kbit: info 00 80 00, write + read block 7 over joybus channel 4");
+        {
+            uint8_t ctl[] = { 0xFF, 0x01, 0x03, 0x00, 0xFF, 0xFF, 0xFF, 0xFE };
+            pif_frame(ctl, sizeof(ctl));
+            HS_CHECK(&TS, N->pif_ram[6] == 0x02, "no controller pak configured: status reports none (0x02)");
+        }
+    }
+    /* SRAM via PI DMA both ways + persistence across reset + save file round trip */
+    core_init(N, HS_N64_CFG_SAVE(4));
+    N->rom_len = 0; n64_save_setup(N);
+    for (i = 0; i < 256u; i++) N->rdram[0x200000u + i] = (uint8_t)(i * 7u + 1u);
+    n64_phys_write32(N, 0x04600000u, 0x200000u, 0xFFFFFFFFu); n64_phys_write32(N, 0x04600004u, 0x08000100u, 0xFFFFFFFFu);
+    n64_phys_write32(N, 0x04600008u, 255u, 0xFFFFFFFFu);                                  /* RDRAM -> SRAM */
+    memset(N->rdram + 0x210000u, 0, 256);
+    n64_phys_write32(N, 0x04600000u, 0x210000u, 0xFFFFFFFFu); n64_phys_write32(N, 0x04600004u, 0x08000100u, 0xFFFFFFFFu);
+    n64_phys_write32(N, 0x0460000Cu, 255u, 0xFFFFFFFFu);                                  /* SRAM -> RDRAM */
+    ok = memcmp(N->rdram + 0x200000u, N->rdram + 0x210000u, 256) == 0 && N->save.data[0x100] == 1u && N->save.size == 32768u;
+    hs_n64_core_ops.reset(N);
+    ok &= N->save.data[0x101] == 8u && N->save.type == N64_SAVE_SRAM;
+    {
+        size_t need = hs_n64_core_ops.save_sram(N, NULL, 0), got;
+        uint8_t *buf = (uint8_t *)malloc(need);
+        got = buf ? hs_n64_core_ops.save_sram(N, buf, need) : 0u;
+        if (buf) { buf[0x102] ^= 0xFFu; ok &= hs_n64_core_ops.load_sram(N, buf, got) == 0 && N->save.data[0x102] == (uint8_t)~15u; free(buf); }
+        ok &= need == 32768u && got == need;
+    }
+    HS_CHECK(&TS, ok, "SRAM 256 Kbit: PI DMA write + read back, survives reset, save file round trip");
+    /* FlashRAM: ID, sector erase, page program, read array, status */
+    core_init(N, HS_N64_CFG_SAVE(5));
+    N->rom_len = 0; n64_save_setup(N);
+    {
+        uint32_t st;
+        ok = 1;
+        n64_phys_write32(N, 0x08010000u, 0xE1000000u, 0xFFFFFFFFu);                       /* read ID */
+        n64_phys_write32(N, 0x04600000u, 0x220000u, 0xFFFFFFFFu); n64_phys_write32(N, 0x04600004u, 0x08000000u, 0xFFFFFFFFu);
+        n64_phys_write32(N, 0x0460000Cu, 7u, 0xFFFFFFFFu);
+        ok &= n64_be32(N->rdram + 0x220000u) == 0x11118001u && n64_be32(N->rdram + 0x220004u) == 0x00C2001Eu;
+        memset(N->save.data + 0x4000u, 0x00, 0x4000u);
+        n64_phys_write32(N, 0x08010000u, 0x4B000080u, 0xFFFFFFFFu);                       /* sector erase page 128 */
+        n64_phys_write32(N, 0x08010000u, 0x78000000u, 0xFFFFFFFFu);
+        n64_phys_write32(N, 0x08010000u, 0xD2000000u, 0xFFFFFFFFu);
+        st = n64_phys_read32(N, 0x08000000u);
+        ok &= N->save.data[0x4000u] == 0xFFu && N->save.data[0x7FFFu] == 0xFFu && (st & 0xFFu) == 0x08u;
+        for (i = 0; i < 128u; i++) N->rdram[0x230000u + i] = (uint8_t)(0xA0u + i);
+        n64_phys_write32(N, 0x08010000u, 0xB4000000u, 0xFFFFFFFFu);                       /* page buffer */
+        n64_phys_write32(N, 0x04600000u, 0x230000u, 0xFFFFFFFFu); n64_phys_write32(N, 0x04600004u, 0x08000000u, 0xFFFFFFFFu);
+        n64_phys_write32(N, 0x04600008u, 127u, 0xFFFFFFFFu);
+        n64_phys_write32(N, 0x08010000u, 0xA5000085u, 0xFFFFFFFFu);                       /* program page 133 */
+        n64_phys_write32(N, 0x08010000u, 0xD2000000u, 0xFFFFFFFFu);
+        ok &= (n64_phys_read32(N, 0x08000000u) & 0xFFu) == 0x04u && N->save.data[133u * 128u] == 0xA0u;
+        n64_phys_write32(N, 0x08010000u, 0xF0000000u, 0xFFFFFFFFu);                       /* read array, page 133 */
+        memset(N->rdram + 0x240000u, 0, 128);
+        n64_phys_write32(N, 0x04600000u, 0x240000u, 0xFFFFFFFFu); n64_phys_write32(N, 0x04600004u, 0x08000000u + 133u * 64u, 0xFFFFFFFFu);
+        n64_phys_write32(N, 0x0460000Cu, 127u, 0xFFFFFFFFu);
+        ok &= memcmp(N->rdram + 0x240000u, N->rdram + 0x230000u, 128) == 0 && N->save.size == 131072u;
+        HS_CHECK(&TS, ok, "FlashRAM 1 Mbit: ID 11118001 00C2001E, sector erase, page program, read array, status");
+    }
+    /* controller pak */
+    core_init(N, HS_N64_CFG_CONTROLLER_PAK);
+    N->rom_len = 0; n64_save_setup(N);
+    {
+        uint8_t f[64];
+        memset(blk, 0, sizeof(blk));
+        ok = n64_pak_crc8(blk, 32) == 0u;
+        for (i = 0; i < 32u; i++) blk[i] = (uint8_t)(i * 13u + 5u);
+        memset(f, 0, sizeof(f));
+        f[0] = 35; f[1] = 1; f[2] = 0x03; f[3] = 0x01; f[4] = 0x20 | 0x15; memcpy(f + 5, blk, 32); f[38] = 0xFE;   /* write 0x0120 */
+        pif_frame(f, 39);
+        ok &= N->pif_ram[37] == n64_pak_crc8(blk, 32) && N->save.pak[0x120] == 5u && N->save.pak_dirty == 1u;
+        memset(f, 0, sizeof(f));
+        f[0] = 3; f[1] = 33; f[2] = 0x02; f[3] = 0x01; f[4] = 0x20; f[38] = 0xFE;                                    /* read 0x0120 */
+        pif_frame(f, 39);
+        ok &= memcmp(N->pif_ram + 5, blk, 32) == 0 && N->pif_ram[37] == n64_pak_crc8(blk, 32);
+        memset(f, 0, sizeof(f)); f[0] = 1; f[1] = 3; f[2] = 0x00; f[6] = 0xFE;
+        pif_frame(f, 7);
+        ok &= N->pif_ram[5] == 0x01;
+        HS_CHECK(&TS, ok, "controller pak: status 0x01, 32-byte write/read at 0x0120, data CRC (crc8 %02x)", n64_pak_crc8(blk, 32));
+    }
+    /* CIC: CRC-32 check value, unknown boot code -> 6102 path, header-checksum variants */
+    core_init(N, 0);
+    {
+        static const char cv[] = "123456789";
+        uint8_t *rom = (uint8_t *)calloc(1, 0x102000u);
+        uint32_t c1, c2, cic, c32;
+        if (!rom) { HS_CHECK(&TS, 0, "alloc rom"); return; }
+        rom[0] = 0x80; rom[1] = 0x37; rom[2] = 0x12; rom[3] = 0x40;
+        n64_wbe32(rom + 8, 0x80000400u);
+        for (i = 0x1000u; i < 0x102000u; i += 4u) n64_wbe32(rom + i, i * 2654435761u);
+        N->rom = rom; N->rom_len = 0x102000u; N->rom_fmt = 0;
+        memcpy(rom + 0x40, cv, 9);
+        cic = n64_cic_detect(N, &c32);
+        ok = cic == 0u && n64_rom_crc32(N, 0x40u, 0x49u) == 0xCBF43926u;
+        n64_rom_crc_cic(N, N64_CIC_6102, &c1, &c2);
+        n64_wbe32(rom + 0x10, c1); n64_wbe32(rom + 0x14, c2);
+        ok &= hs_n64_core_ops.load_rom(N, rom, 0x102000u) == 0 && N->rom_crc_ok == 1u && N->save.cic == N64_CIC_6102 && !N->save.cic_known &&
+              N->cpu.gpr[22] == 0x3Fu && N->cpu.pc == 0xFFFFFFFF80000400ull;
+        {
+            uint32_t a1, a2, b1, b2, d1, d2;
+            n64_rom_crc_cic(N, N64_CIC_6103, &a1, &a2); n64_rom_crc_cic(N, N64_CIC_6105, &b1, &b2); n64_rom_crc_cic(N, N64_CIC_6106, &d1, &d2);
+            ok &= a1 != c1 && b1 != c1 && d1 != c1 && a2 != b2 && b2 != d2;
+        }
+        {
+            static const char ids[3][3] = { "SM", "ZL", "ZS" };
+            static const uint32_t ty[3] = { N64_SAVE_EEP4K, N64_SAVE_SRAM, N64_SAVE_FLASH }, mem[3] = { 4u << 20, 4u << 20, 8u << 20 };
+            uint32_t k, okid = 1;
+            for (k = 0; k < 3u; k++) {
+                core_init(N, 0);
+                rom[0x3C] = (uint8_t)ids[k][0]; rom[0x3D] = (uint8_t)ids[k][1];
+                okid &= hs_n64_core_ops.load_rom(N, rom, 0x102000u) == 0 && N->save.type == ty[k] && N->rdram_size == mem[k] &&
+                        n64_be32(N->rdram + 0x318u) == mem[k];
+            }
+            HS_CHECK(&TS, okid, "header ID table: SM -> EEPROM 4K, ZL -> SRAM, ZS -> FlashRAM + 8 MiB (synthetic headers)");
+        }
+        HS_CHECK(&TS, ok, "CIC: CRC-32 check value CBF43926, unknown IPL3 -> 6102 boot (seed 0x3F), 6103/6105/6106 checksum variants distinct");
+        N->rom = NULL; N->rom_len = 0;
+        free(rom);
+    }
+    core_init(N, 0);
+}
+
 /* ================================================================ main */
 int main(int argc, char **argv)
 {
@@ -1401,6 +1905,9 @@ int main(int argc, char **argv)
     test_rdp();
     test_isolation();
     test_demo_rom();
+    test_fastpath();
+    test_panfrost();
+    test_compat();
     printf("RESULT %u/%u\n", TS.pass, TS.pass + TS.fail);
     free(ROM); free(FB); free(FB2); free(N);
     return TS.fail ? 1 : 0;

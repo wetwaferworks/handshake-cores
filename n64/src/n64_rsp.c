@@ -498,6 +498,188 @@ static void gfx_task(hs_n64_t *n, uint32_t dl, uint32_t flags)
     n->rsp.hle_gfx++;
 }
 
+/* ------------------------------------------------- microcode identification
+ * Commercial OSTasks carry ucode / ucode_data pointers. The microcode's data
+ * segment contains a readable version banner; the HLE engine picks the command
+ * encoding from it. Tasks with ucode_data == 0 (HandshakeOS demo / homebrew HS
+ * tasks) keep the original HS behaviour, so existing ROMs are unaffected. */
+static int has_str(const uint8_t *p, uint32_t len, const char *s)
+{
+    uint32_t i, k, sl = (uint32_t)strlen(s);
+    for (i = 0; i + sl <= len; i++) {
+        for (k = 0; k < sl && p[i + k] == (uint8_t)s[k]; k++) {}
+        if (k == sl) return 1;
+    }
+    return 0;
+}
+
+uint32_t n64_ucode_classify(const uint8_t *data, uint32_t len)
+{
+    if (has_str(data, len, "F3DEX2") || has_str(data, len, "F3DZEX") || has_str(data, len, "F3DLX2") ||
+        has_str(data, len, "F3DLP2") || has_str(data, len, "F3DLX.Rej2") || has_str(data, len, "F3DFLX2")) return N64_UC_F3DEX2;
+    if (has_str(data, len, "S2DEX")) return N64_UC_S2DEX;
+    if (has_str(data, len, "L3DEX") ) return N64_UC_UNKNOWN_GFX;
+    if (has_str(data, len, "F3DEX") || has_str(data, len, "F3DLX") || has_str(data, len, "F3DLP")) return N64_UC_F3DEX;
+    if (has_str(data, len, "RSP SW Version: 2.0") || has_str(data, len, "RSP Gfx ucode F3D") ) return N64_UC_FAST3D;
+    return N64_UC_UNKNOWN_GFX;
+}
+
+static uint32_t ucode_kind(hs_n64_t *n, uint32_t ucode_data, uint32_t size)
+{
+    n64_ucinfo_t *u = &n->ucinfo;
+    uint8_t buf[0x800];
+    uint32_t i, len = size ? size : 0x800u;
+    if (ucode_data == 0u) return N64_UC_HS;
+    if (u->addr == ucode_data && u->valid) { u->hits++; return u->kind; }
+    if (len > sizeof(buf)) len = sizeof(buf);
+    for (i = 0; i < len; i++) buf[i] = rd8(n, ucode_data + i);
+    u->addr = ucode_data; u->valid = 1u; u->kind = n64_ucode_classify(buf, len); u->detects++;
+    return u->kind;
+}
+
+/* F3DEX2 geometry-mode bits -> the internal (Fast3D / F3DEX) layout */
+static uint32_t geom_from_f3dex2(uint32_t m)
+{
+    uint32_t g = m & (G_ZBUFFER | G_SHADE | G_FOG | G_LIGHTING | 0x000C0000u);   /* same positions */
+    if (m & 0x00000200u) g |= G_CULL_FRONT;
+    if (m & 0x00000400u) g |= G_CULL_BACK;
+    if (m & 0x00200000u) g |= G_SHADING_SMOOTH;
+    return g;
+}
+
+static void do_mtx(hs_n64_t *n, uint32_t addr, int proj, int load, int push)
+{
+    n64_gfx_t *g = &n->gfx;
+    int32_t m[16];
+    uint8_t raw[64];
+    uint32_t i;
+    for (i = 0; i < 64u; i++) raw[i] = rd8(n, addr + i);
+    n64_rsp_load_mtx(raw, m);
+    if (proj) {
+        if (load) memcpy(g->proj, m, sizeof(m)); else n64_rsp_matmul(m, g->proj, g->proj);
+    } else {
+        if (push && g->mv_top < 9u) { memcpy(g->mv[g->mv_top + 1u], g->mv[g->mv_top], sizeof(m)); g->mv_top++; }
+        if (load) memcpy(g->mv[g->mv_top], m, sizeof(m)); else n64_rsp_matmul(m, g->mv[g->mv_top], g->mv[g->mv_top]);
+    }
+    g->mvp_valid = 0;
+}
+
+/* F3DEX2 / F3DZEX (Zelda) command decoder. Same vertex format, lighting,
+ * clipping and RDP front end as the F3DEX path; only the encodings differ. */
+static void gfx_task_f3dex2(hs_n64_t *n, uint32_t dl)
+{
+    n64_gfx_t *g = &n->gfx;
+    n64_snap_t *b = n64_back(n);
+    uint32_t stack[18], sp = 0, pc = dl & 0x00FFFFF8u, k, geom2 = 0;
+    uint32_t keep_om_hi = g->om_hi, keep_om_lo = g->om_lo;
+    gfx_reset(g);
+    g->om_hi = keep_om_hi; g->om_lo = keep_om_lo;
+    g->f3d_mode = 0;
+    b->gfx_tasks++;
+    for (k = 0; k < N64_DL_MAX_CMDS; k++) {
+        uint32_t w0 = rd32(n, pc), w1 = rd32(n, pc + 4u), op = w0 >> 24;
+        uint32_t cmd[4];
+        pc += 8u;
+        switch (op) {
+        case 0x00: case 0xE0: case 0x03: case 0x08: case 0xD3: case 0xD4: case 0xD5: case 0xD6: break; /* NOOP, CULLDL (conservative), LINE3D, SPECIAL, DMA_IO */
+        case 0x01: {                                    /* G_VTX: n in bits 12-19, end index*2 in bits 1-7 */
+            uint32_t cnt = (w0 >> 12) & 0xFFu, end = (w0 >> 1) & 0x7Fu;
+            if (cnt && cnt <= end) load_vertices(n, seg_addr(n, w1), end - cnt, cnt);
+            break;
+        }
+        case 0x02: n->ucinfo.unhandled++; break;        /* G_MODIFYVTX: not yet */
+        case 0x04:                                      /* G_BRANCH_Z: always take the near (high-detail) branch */
+            pc = seg_addr(n, g->rdphalf1) & ~7u;
+            break;
+        case 0x05:
+            draw_tri(n, ((w0 >> 16) & 0xFFu) >> 1, ((w0 >> 8) & 0xFFu) >> 1, (w0 & 0xFFu) >> 1);
+            break;
+        case 0x06: case 0x07:                           /* G_TRI2, G_QUAD */
+            draw_tri(n, ((w0 >> 16) & 0xFFu) >> 1, ((w0 >> 8) & 0xFFu) >> 1, (w0 & 0xFFu) >> 1);
+            draw_tri(n, ((w1 >> 16) & 0xFFu) >> 1, ((w1 >> 8) & 0xFFu) >> 1, (w1 & 0xFFu) >> 1);
+            break;
+        case 0xD7:                                      /* G_TEXTURE */
+            g->tex_on = ((w0 >> 1) & 0x7Fu) ? 1u : 0u;
+            g->tex_tile = (w0 >> 8) & 7u;
+            g->tex_sscale = w1 >> 16;
+            g->tex_tscale = w1 & 0xFFFFu;
+            break;
+        case 0xD8: {                                    /* G_POPMTX: w1 = 64 * count */
+            uint32_t c = w1 >> 6;
+            while (c-- && g->mv_top) g->mv_top--;
+            g->mvp_valid = 0;
+            break;
+        }
+        case 0xD9:                                      /* G_GEOMETRYMODE: and ~clear, or set */
+            geom2 = (geom2 & (w0 | 0xFF000000u)) | w1;
+            g->geom = geom_from_f3dex2(geom2);
+            break;
+        case 0xDA: {                                    /* G_MTX: params ^ PUSH(1); LOAD 2, PROJECTION 4 */
+            uint32_t p = (w0 & 0xFFu) ^ 0x01u;
+            do_mtx(n, seg_addr(n, w1), (p & 4u) != 0, (p & 2u) != 0, (p & 1u) != 0);
+            break;
+        }
+        case 0xDB: {                                    /* G_MOVEWORD: index bits 16-23, offset 0-15 */
+            uint32_t idx = (w0 >> 16) & 0xFFu, off = w0 & 0xFFFFu;
+            if (idx == 0x02u) g->num_lights = w1 / 24u;
+            else if (idx == 0x06u) g->seg[(off >> 2) & 15u] = w1 & 0x00FFFFFFu;
+            else if (idx == 0x08u) { g->fog_mul = (int16_t)(w1 >> 16); g->fog_off = (int16_t)(w1 & 0xFFFFu); }
+            else if (idx == 0x0Au) {                    /* G_MW_LIGHTCOL: light (off/24), col or copy */
+                uint32_t l = off / 24u;
+                if (l < 8u && (off % 24u) == 0u) { g->light_col[l][0] = (uint8_t)(w1 >> 24); g->light_col[l][1] = (uint8_t)(w1 >> 16); g->light_col[l][2] = (uint8_t)(w1 >> 8); }
+            }
+            if (g->num_lights > 7u) g->num_lights = 7u;
+            break;
+        }
+        case 0xDC: {                                    /* G_MOVEMEM: index bits 0-7, offset*8 bits 8-15 */
+            uint32_t idx = w0 & 0xFFu, off = ((w0 >> 8) & 0xFFu) * 8u, a = seg_addr(n, w1), i;
+            if (idx == 8u) {                            /* G_MV_VIEWPORT */
+                for (i = 0; i < 4u; i++) { g->vp_scale[i] = rd16s(n, a + i * 2u); g->vp_trans[i] = rd16s(n, a + 8u + i * 2u); }
+            } else if (idx == 10u && off >= 48u) {      /* G_MV_LIGHT: light l at (l + 2) * 24 */
+                uint32_t l = off / 24u - 2u;
+                if (l < 8u) for (i = 0; i < 3u; i++) { g->light_col[l][i] = rd8(n, a + i); g->light_dir[l][i] = (int8_t)rd8(n, a + 8u + i); }
+            } else if (idx == 14u) n->ucinfo.unhandled++;   /* G_MV_MATRIX (forced MVP): not yet */
+            break;
+        }
+        case 0xDD: n->ucinfo.unhandled++; break;        /* G_LOAD_UCODE: not yet */
+        case 0xDE:                                      /* G_DL (push unless bits 16-23 set) */
+            if (((w0 >> 16) & 0xFFu) == 0u) { if (sp < 18u) stack[sp++] = pc; else break; }
+            pc = seg_addr(n, w1) & ~7u;
+            break;
+        case 0xDF:                                      /* G_ENDDL */
+            if (sp == 0u) { k = N64_DL_MAX_CMDS; break; }
+            pc = stack[--sp];
+            break;
+        case 0xE1: g->rdphalf1 = w1; break;
+        case 0xF1: g->rdphalf2 = w1; break;
+        case 0xE2: case 0xE3: {                         /* SETOTHERMODE_L / _H: shift = 32 - s - len */
+            uint32_t len = (w0 & 0xFFu) + 1u, s = (w0 >> 8) & 0xFFu, sh = (32u > s + len) ? 32u - s - len : 0u;
+            uint32_t m = (len >= 32u ? 0xFFFFFFFFu : ((1u << len) - 1u)) << (sh & 31u);
+            if (op == 0xE2) g->om_lo = (g->om_lo & ~m) | (w1 & m);
+            else g->om_hi = (g->om_hi & ~m) | (w1 & m);
+            cmd[0] = (0xEFu << 24) | (g->om_hi & 0x00FFFFFFu); cmd[1] = g->om_lo;
+            n64_rdp_ingest(n, cmd, 2);
+            break;
+        }
+        case 0xE4: case 0xE5: {                         /* texture rectangle + RDPHALF_1/2 commands */
+            uint32_t h1 = rd32(n, pc + 4u), h2 = rd32(n, pc + 12u);
+            pc += 16u;
+            cmd[0] = w0; cmd[1] = w1; cmd[2] = h1; cmd[3] = h2;
+            n64_rdp_ingest(n, cmd, 4);
+            break;
+        }
+        default:
+            if (op >= 0xE6u) {                          /* RDP pass-through (0xE6..0xFF) */
+                cmd[0] = w0; cmd[1] = w1;
+                if (op == 0xFDu || op == 0xFFu || op == 0xFEu) cmd[1] = seg_addr(n, w1);
+                n64_rdp_ingest(n, cmd, 2);
+            } else n->ucinfo.unhandled++;
+            break;
+        }
+    }
+    n->rsp.hle_gfx++;
+}
+
 /* ------------------------------------------------------- HLE audio */
 static int16_t dm16(const hs_n64_t *n, uint32_t a) { a &= 0xFFEu; return (int16_t)n64_be16(n->rsp.dmem + a); }
 static void dw16(hs_n64_t *n, uint32_t a, int32_t v) { a &= 0xFFEu; n64_wbe16(n->rsp.dmem + a, (uint16_t)(int16_t)clamp32(v, -32768, 32767)); }
@@ -711,11 +893,17 @@ void n64_rsp_start(hs_n64_t *n)
     uint32_t flags = n64_be32(r->dmem + 0xFC4u);
     uint32_t data = n64_be32(r->dmem + 0xFF0u) & 0x00FFFFFFu;
     uint32_t size = n64_be32(r->dmem + 0xFF4u);
+    uint32_t ucd = n64_be32(r->dmem + 0xFD8u) & 0x00FFFFFFu, ucd_size = n64_be32(r->dmem + 0xFDCu);
     if (type == 1u) {
-        gfx_task(n, data, flags);
+        uint32_t kind = ucode_kind(n, ucd, ucd_size);
+        if (kind == N64_UC_F3DEX2) gfx_task_f3dex2(n, data);
+        else if (kind == N64_UC_HS) gfx_task(n, data, flags);
+        else if (kind == N64_UC_FAST3D || kind == N64_UC_F3DEX) gfx_task(n, data, kind == N64_UC_FAST3D ? 0x8000u : 0u);
+        else n->ucinfo.unknown_tasks++;      /* S2DEX / unknown: skipped, counted */
         r->status |= 0x200u;                 /* SIG2: task done */
     } else if (type == 2u) {
-        audio_task(n, data, size);
+        if (ucd == 0u) audio_task(n, data, size);
+        else n->ucinfo.audio_skipped++;      /* Nintendo audio ABIs not implemented yet: silent, RDRAM untouched */
     } else {
         lle_run(n);
     }

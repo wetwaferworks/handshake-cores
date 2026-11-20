@@ -4,6 +4,7 @@
 # then verify bit-identical state/frame hashes and byte-identical PNG/WAV outputs.
 set -euo pipefail
 cd "$(dirname "$0")"
+mkdir -p build/tmp; export TMPDIR=$PWD/build/tmp
 LOG=build/logs; mkdir -p "$LOG" out/x86_64 out/aarch64
 ./build.sh
 rc=0
@@ -24,4 +25,14 @@ echo "cross-arch output files byte-identical: $same/$tot"
 sha256sum out/x86_64/*.png out/x86_64/*.wav | sed 's#out/x86_64/##' > $LOG/sha256_outputs.txt
 cat $LOG/sha256_outputs.txt
 for a in x86_64 aarch64; do echo "== $a =="; grep -E '^(TIME|RMS|INFO)' $LOG/test_$a.log; done
+# per-phase bench (min of 3 runs of 90 frames), fast paths and reference paths
+./build/x86_64/bench_n64 --slices=3 > "$LOG/bench_x86_64.log" 2>&1 || rc=1
+./build/x86_64/bench_n64 --slices=1 --ref >> "$LOG/bench_x86_64.log" 2>&1 || rc=1
+qemu-aarch64-static -cpu cortex-a53 ./build/aarch64/bench_n64 --slices=3 > "$LOG/bench_aarch64.log" 2>&1 || rc=1
+qemu-aarch64-static -cpu cortex-a53 ./build/aarch64/bench_n64 --slices=1 --ref >> "$LOG/bench_aarch64.log" 2>&1 || rc=1
+for a in x86_64 aarch64; do echo "== bench $a =="; cat "$LOG/bench_$a.log"; done
+# Panfrost probe: on WSL/x86 there is no Mali render node, so "cannot open device" (exit 2) is the expected result;
+# the aarch64 binary build/aarch64/hs_pf_probe is the one to run on the RG35XX.
+pr=0; ./build/x86_64/hs_pf_probe > "$LOG/pf_probe_x86_64.log" 2>&1 || pr=$?
+echo "== hs_pf_probe (x86_64 host, exit $pr) =="; cat "$LOG/pf_probe_x86_64.log"
 exit $rc

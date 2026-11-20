@@ -3,21 +3,27 @@
  *
  * hs_n64.c - hs_core_ops_t glue for the hs-n64 clean-room N64 core.
  */
+#include <stddef.h>
 #include <string.h>
 #include "n64_internal.h"
 
 static size_t n64_state_size(void) { return sizeof(hs_n64_t); }
 
-static int n64_init(void *mem, size_t mem_size, const hs_core_config_t *cfg)
+static void init_state(hs_n64_t *n, uint32_t flags, int keep_save)
 {
-    hs_n64_t *n = (hs_n64_t *)mem;
-    if (!mem || mem_size < sizeof(hs_n64_t)) return -1;
-    memset(n, 0, sizeof(*n));
+    /* the cartridge save + controller pak (last member) survive a console reset */
+    memset(n, 0, keep_save ? offsetof(hs_n64_t, save) : sizeof(*n));
     n->magic = N64_MAGIC;
-    n->cfg_flags = cfg ? cfg->flags : 0u;
+    n->cfg_flags = flags;
     n->rdram_size = (n->cfg_flags & HS_N64_CFG_EXPANSION_PAK) ? N64_RDRAM_MAX : N64_RDRAM_BASE_SIZE;
     n64_cpu_reset(n);
     n->rsp.status = 1u;
+}
+
+static int n64_init(void *mem, size_t mem_size, const hs_core_config_t *cfg)
+{
+    if (!mem || mem_size < sizeof(hs_n64_t)) return -1;
+    init_state((hs_n64_t *)mem, cfg ? cfg->flags : 0u, 0);
     return 0;
 }
 
@@ -26,11 +32,7 @@ static void n64_reset(void *core)
     hs_n64_t *n = (hs_n64_t *)core;
     const uint8_t *rom = n->rom;
     size_t len = n->rom_len;
-    hs_core_config_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.console_id = HS_SYS_N64;
-    cfg.flags = n->cfg_flags;
-    n64_init(n, sizeof(*n), &cfg);
+    init_state(n, n->cfg_flags, 1);
     if (rom && n64_rom_load(n, rom, len) == 0) n64_pif_boot(n);
 }
 
@@ -42,11 +44,30 @@ static int n64_load_rom(void *core, const uint8_t *rom, size_t len)
     return 0;
 }
 
+/* save file = cartridge save memory (type-sized) followed, when the controller
+ * pak is enabled, by the 32 KiB pak image */
 static int n64_load_sram(void *core, const uint8_t *buf, size_t len)
-{ (void)core; (void)buf; (void)len; return -1; }
+{
+    hs_n64_t *n = (hs_n64_t *)core;
+    n64_save_t *s = &n->save;
+    size_t want = s->size + (s->pak_on ? N64_PAK_SIZE : 0u);
+    if (!buf || (len != want && len != s->size) || (s->size == 0u && !s->pak_on)) return -1;
+    memcpy(s->data, buf, s->size);
+    if (len == want && s->pak_on) memcpy(s->pak, buf + s->size, N64_PAK_SIZE);
+    return 0;
+}
 
 static size_t n64_save_sram(const void *core, uint8_t *buf, size_t cap)
-{ (void)core; (void)buf; (void)cap; return 0; }
+{
+    const hs_n64_t *n = (const hs_n64_t *)core;
+    const n64_save_t *s = &n->save;
+    size_t want = s->size + (s->pak_on ? N64_PAK_SIZE : 0u);
+    if (!buf) return want;
+    if (cap < want) return 0;
+    memcpy(buf, s->data, s->size);
+    if (s->pak_on) memcpy(buf + s->size, s->pak, N64_PAK_SIZE);
+    return want;
+}
 
 static void n64_step(void *core, uint32_t input_bits, int64_t rtc_epoch_sec)
 {

@@ -25,6 +25,7 @@ static uint32_t rom_word(const hs_n64_t *n, uint32_t off)
     return ((uint32_t)rom_byte(n, off) << 24) | ((uint32_t)rom_byte(n, off + 1u) << 16) |
            ((uint32_t)rom_byte(n, off + 2u) << 8) | rom_byte(n, off + 3u);
 }
+uint32_t n64_rom_word(const hs_n64_t *n, uint32_t off) { return rom_word(n, off); }
 
 int n64_rom_detect_swap(const uint8_t *rom, size_t len)
 {
@@ -85,6 +86,13 @@ int n64_rom_load(hs_n64_t *n, const uint8_t *rom, size_t len)
     n->rom_crc1 = c1;
     n->rom_crc2 = c2;
     n->rom_crc_ok = (c1 == rom_word(n, 0x10u) && c2 == rom_word(n, 0x14u)) ? 1u : 0u;
+    n64_save_setup(n);                       /* save type + CIC identity */
+    if (n->save.cic_known && n->save.cic != N64_CIC_6102 && n->save.cic != N64_CIC_6101) {
+        n64_rom_crc_cic(n, n->save.cic, &c1, &c2);
+        n->rom_crc1 = c1;
+        n->rom_crc2 = c2;
+        n->rom_crc_ok = (c1 == rom_word(n, 0x10u) && c2 == rom_word(n, 0x14u)) ? 1u : 0u;
+    }
     return 0;
 }
 
@@ -98,7 +106,10 @@ static void pi_dma_to_rdram(hs_n64_t *n, uint32_t len)
     uint32_t dram = n->pi_dram & 0x00FFFFFEu, cart = n->pi_cart & ~1u, i;
     uint32_t xr = rom_xor(n);
     if (len > n->rdram_size) len = n->rdram_size;
-    if (cart >= 0x10000000u && cart < 0x1FC00000u) {
+    if (cart >= 0x08000000u && cart < 0x10000000u) {          /* domain 2: SRAM / FlashRAM */
+        if (dram + len > n->rdram_size) len = n->rdram_size > dram ? n->rdram_size - dram : 0u;
+        n64_cart2_dma_read(n, cart, n->rdram + dram, len);
+    } else if (cart >= 0x10000000u && cart < 0x1FC00000u) {
         uint32_t off = cart - 0x10000000u;
         for (i = 0; i < len; i++) {
             uint32_t d = dram + i, o = off + i;
@@ -156,14 +167,16 @@ static void sp_status_write(hs_n64_t *n, uint32_t v)
 }
 
 /* ------------------------------------------------------------- PIF */
-static void pif_controller(hs_n64_t *n, uint8_t cmd, uint8_t *res, uint32_t rx)
+static void pif_controller(hs_n64_t *n, const uint8_t *cmdp, uint32_t tx, uint8_t *res, uint32_t rx)
 {
     uint32_t in = n->input, b = 0;
+    uint8_t cmd = cmdp[0];
     int8_t sx = 0, sy = 0;
     if (cmd == 0x00 || cmd == 0xFF) {
-        if (rx >= 3u) { res[0] = 0x05; res[1] = 0x00; res[2] = 0x02; }
+        if (rx >= 3u) { res[0] = 0x05; res[1] = 0x00; res[2] = n->save.pak_on ? 0x01 : 0x02; }
         return;
     }
+    if (cmd == 0x02 || cmd == 0x03) { (void)n64_pak_cmd(n, cmdp, tx, res, rx); return; }
     if (cmd == 0x01 && rx >= 4u) {
         if (in & HS_N64_A) b |= 0x8000u;
         if (in & HS_N64_B) b |= 0x4000u;
@@ -203,8 +216,8 @@ void n64_pif_process(hs_n64_t *n)
         ci = i + 2u;
         ri = ci + tx;
         if (ri + rx > 63u) break;
-        if (ch == 0u) pif_controller(n, ram[ci], &ram[ri], rx);
-        else ram[i + 1u] |= 0x80u;
+        if (ch == 0u) pif_controller(n, &ram[ci], tx, &ram[ri], rx);
+        else if (n64_save_joybus(n, ch, &ram[ci], tx, &ram[ri], rx) != 0) ram[i + 1u] |= 0x80u;   /* no device */
         i = ri + rx;
         ch++;
     }
@@ -303,6 +316,7 @@ uint32_t n64_phys_read32(hs_n64_t *n, uint32_t pa)
         return 0;
     default: break;
     }
+    if (pa >= 0x08000000u && pa < 0x10000000u) return n64_cart2_read32(n, pa);
     if (pa >= 0x10000000u && pa < 0x1FC00000u) return rom_word(n, pa - 0x10000000u);
     if (pa >= 0x1FC007C0u && pa < 0x1FC00800u) return n64_be32(n->pif_ram + (pa & 0x3Cu));
     return 0;
@@ -371,7 +385,15 @@ void n64_phys_write32(hs_n64_t *n, uint32_t pa, uint32_t v, uint32_t mask)
         switch (r) {
         case 0: n->pi_dram = v & 0xFFFFFEu; return;
         case 1: n->pi_cart = v & ~1u; return;
-        case 2: n->pi_dma_count++; n64_mi_raise(n, MI_PI); n->pi_status = 0x8u; return; /* RDRAM->cart: no writable cart memory */
+        case 2: {                                       /* RDRAM -> cart: only domain 2 save memory is writable */
+            uint32_t len = (v & 0xFFFFFFu) + 1u, dram = n->pi_dram & 0x00FFFFFEu, cart = n->pi_cart & ~1u;
+            if (cart >= 0x08000000u && cart < 0x10000000u && dram < n->rdram_size) {
+                if (dram + len > n->rdram_size) len = n->rdram_size - dram;
+                n64_cart2_dma_write(n, cart, n->rdram + dram, len);
+                n->pi_dram = dram + len; n->pi_cart = cart + len;
+            }
+            n->pi_dma_count++; n64_mi_raise(n, MI_PI); n->pi_status = 0x8u; return;
+        }
         case 3: pi_dma_to_rdram(n, (v & 0xFFFFFFu) + 1u); return;
         case 4: if (v & 2u) { n->pi_status &= ~0x8u; n64_mi_clear(n, MI_PI); } return;
         default: if (r >= 5u && r < 13u) n->pi_dom[r - 5u] = v; return;
@@ -394,6 +416,7 @@ void n64_phys_write32(hs_n64_t *n, uint32_t pa, uint32_t v, uint32_t mask)
         return;
     default: break;
     }
+    if (pa >= 0x08000000u && pa < 0x10000000u) { n64_cart2_write32(n, pa, v); return; }
     if (pa >= 0x1FC007C0u && pa < 0x1FC00800u) {
         uint8_t *p = n->pif_ram + (pa & 0x3Cu);
         n64_wbe32(p, (n64_be32(p) & ~mask) | (v & mask));
@@ -404,8 +427,10 @@ void n64_phys_write32(hs_n64_t *n, uint32_t pa, uint32_t v, uint32_t mask)
 void n64_pif_boot(hs_n64_t *n)
 {
     n64_cpu_t *c = &n->cpu;
-    uint32_t entry = rom_word(n, 0x08u);
+    uint32_t entry = rom_word(n, 0x08u), cic = n->save.cic;
     uint32_t len = 0x100000u;
+    if (cic == N64_CIC_6103) entry -= 0x100000u;        /* these IPL3s load below the header entry */
+    else if (cic == N64_CIC_6106) entry -= 0x200000u;
     if ((size_t)len + 0x1000u > n->rom_len) len = (uint32_t)(n->rom_len - 0x1000u);
     n64_cpu_reset(n);
     /* IPL3 behaviour: copy the first MiB after the boot code to the entry
@@ -416,10 +441,11 @@ void n64_pif_boot(hs_n64_t *n)
     n64_mi_clear(n, MI_PI);
     n->pi_status = 0;
     n64_wbe32(n->rdram + 0x318u, n->rdram_size);    /* osMemSize */
+    if (cic == N64_CIC_6105) n64_wbe32(n->rdram + 0x3F0u, n->rdram_size);   /* 6105 titles read it here */
     c->gpr[19] = 0;                                  /* s3: ROM boot */
     c->gpr[20] = 1;                                  /* s4: NTSC */
     c->gpr[21] = 0;                                  /* s5: cold reset */
-    c->gpr[22] = 0x3Fu;                              /* s6: CIC seed (6102) */
+    c->gpr[22] = cic == N64_CIC_6103 ? 0x78u : cic == N64_CIC_6105 ? 0x91u : cic == N64_CIC_6106 ? 0x85u : 0x3Fu; /* s6: CIC seed */
     c->gpr[23] = 0;
     c->gpr[29] = 0xFFFFFFFFA4001FF0ull;              /* sp */
     c->gpr[31] = 0xFFFFFFFFA4001550ull;
