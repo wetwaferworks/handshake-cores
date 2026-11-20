@@ -1,0 +1,16 @@
+# HandshakeOS clean-room cores: generated output (push prep, REVIEW.md)
+build/
+out/
+logs/
+*/build/x86_64/
+*/build/aarch64/
+*/build/logs/
+*/build/tools/
+*/out/
+*/logs/
+*.o
+*.tmp
+*.wav
+!gba/build/
+gba/build/*
+!gba/build/bench.sh
