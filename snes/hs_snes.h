@@ -153,6 +153,18 @@ typedef struct hs_snes_dsp {
     int16_t  prev_l, prev_r;
     uint32_t rs_phase;                /* 0..2 thirds                        */
     uint32_t total_out;
+    /* v5.7 audio: Bresenham remainder + mix diagnostics (phase 2 only) */
+    uint32_t samp_err;                /* 32 kHz 532/533 remainder           */
+    uint32_t last_n32;                /* 32 kHz samples last frame          */
+    uint32_t last_n48;                /* 48 kHz frames last frame           */
+    uint32_t clips;                   /* samples that hit the final clamp   */
+    uint32_t peak;                    /* max |sample| before the clamp      */
+#ifdef HS_SNES_AUDIO_DEBUG
+#define HS_SNES_DBG_FRAMES 600
+    uint16_t dbg_n32[HS_SNES_DBG_FRAMES];
+    uint16_t dbg_n48[HS_SNES_DBG_FRAMES];
+    uint32_t dbg_n;
+#endif
 } hs_snes_dsp;
 
 typedef struct hs_snes hs_snes;       /* phase-0 machine (opaque size)     */

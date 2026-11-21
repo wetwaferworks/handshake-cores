@@ -116,9 +116,10 @@ void hs_snes_step_cpu_phase(hs_snes *s, hs_snes_slot *out)
             snes_cpu_step(s);
         }
         check_irq(s);
+        /* Per-scanline SPC catch-up: one slice per line, not a frame burst. */
         snes_apu_catchup(s);
     }
-    s->frame_start += (uint64_t)SNES_LINES_PER_FRAME * SNES_MASTER_PER_LINE;
+    s->frame_start += (uint64_t)SNES_MASTER_PER_FRAME;
     if (s->master < s->frame_start) s->master = s->frame_start;
     snes_apu_catchup(s);
     out->sample_end = (uint32_t)(s->spc.cycles >> 5);

@@ -570,6 +570,9 @@ int snes_spc_step(hs_snes *s)
     return cyc;
 }
 
+/* Run the SPC700 up to the current master-clock time. Called at the end
+   of every scanline (and after CPU APU-port I/O), so the SPC and DSP write
+   log are interleaved through the frame, not executed as one burst. */
 void snes_apu_catchup(hs_snes *s)
 {
     uint64_t target = (s->master * SNES_SPC_HZ) / SNES_MASTER_HZ;
@@ -725,7 +728,8 @@ static void envelope(hs_snes_dsp *d, hs_snes_voice *vs, const uint8_t *R, const 
 static void dsp_sample(hs_snes_dsp *d, int *out_l, int *out_r)
 {
     uint8_t tick[32];
-    int mainl = 0, mainr = 0, echol = 0, echor = 0, i, r;
+    int32_t mainl = 0, mainr = 0, echol = 0, echor = 0;
+    int i, r;
     uint8_t flg = d->reg[0x6C], pmon = d->reg[0x2D], non = d->reg[0x3D], eon = d->reg[0x4D], koff = d->reg[0x5C];
     int prev_out = 0;
 
@@ -774,9 +778,11 @@ static void dsp_sample(hs_snes_dsp *d, int *out_l, int *out_r)
         R[8] = (uint8_t)(vs->env >> 4);
         R[9] = (uint8_t)(out >> 8);
         {
-            int vl = (out * (int8_t)R[0]) >> 7, vr = (out * (int8_t)R[1]) >> 7;
-            mainl = clamp16(mainl + vl); mainr = clamp16(mainr + vr);
-            if (eon & (1u << i)) { echol = clamp16(echol + vl); echor = clamp16(echor + vr); }
+            int32_t vl = (out * (int8_t)R[0]) >> 7, vr = (out * (int8_t)R[1]) >> 7;
+            /* Delay the clamp until after MVOL + echo so mid-mix overflow
+               cannot turn a loud chord into a periodic crackle. */
+            mainl += vl; mainr += vr;
+            if (eon & (1u << i)) { echol += vl; echor += vr; }
         }
         /* advance pitch counter; keep >= 4 decoded samples ahead */
         vs->pos += (uint32_t)pitch;
@@ -822,13 +828,23 @@ static void dsp_sample(hs_snes_dsp *d, int *out_l, int *out_r)
         }
         d->echo_pos = (uint16_t)(d->echo_pos + 4u);
         if (d->echo_pos >= len) d->echo_pos = 0;
-        mainl = clamp16(((mainl * (int8_t)d->reg[0x0C]) >> 7) + eol);
-        mainr = clamp16(((mainr * (int8_t)d->reg[0x1C]) >> 7) + eor);
+        mainl = ((mainl * (int8_t)d->reg[0x0C]) >> 7) + eol;
+        mainr = ((mainr * (int8_t)d->reg[0x1C]) >> 7) + eor;
     }
     if (flg & 0x40u) { mainl = 0; mainr = 0; }
+    mainl >>= SNES_MIX_HEADROOM_SHIFT;
+    mainr >>= SNES_MIX_HEADROOM_SHIFT;
+    {
+        int32_t al = mainl < 0 ? -mainl : mainl;
+        int32_t ar = mainr < 0 ? -mainr : mainr;
+        if ((uint32_t)al > d->peak) d->peak = (uint32_t)al;
+        if ((uint32_t)ar > d->peak) d->peak = (uint32_t)ar;
+        if (mainl > 32767 || mainl < -32768) d->clips++;
+        else if (mainr > 32767 || mainr < -32768) d->clips++;
+    }
     d->reg[0x7C] = (uint8_t)d->endx;
-    *out_l = mainl;
-    *out_r = mainr;
+    *out_l = clamp16((int)mainl);
+    *out_r = clamp16((int)mainr);
 }
 
 static void apply_event(hs_snes_dsp *d, const hs_snes_apu_event *e)
@@ -839,17 +855,31 @@ static void apply_event(hs_snes_dsp *d, const hs_snes_apu_event *e)
 
 int hs_snes_synth_audio_phase(const hs_snes_slot *slot, hs_snes_dsp *d, int16_t *pcm, int max_frames)
 {
+    /* 32 kHz -> 48 kHz: 2 input samples produce 3 output samples. */
     static const uint8_t k_w[3] = {0, 85, 171};
-    uint32_t ev = 0, n = slot->apu_log_count, smp;
-    uint32_t begin = slot->sample_begin, end = slot->sample_end;
+    uint32_t ev = 0, n = slot->apu_log_count, smp, produced = 0, want;
+    uint32_t begin = slot->sample_begin;
     int out = 0;
+
     if (n > HS_SNES_APU_LOG_MAX) n = HS_SNES_APU_LOG_MAX;
-    if (end - begin > 2048u) end = begin + 2048u;      /* bounded per frame */
-    for (smp = begin; smp != end; smp++) {
+
+    /* Fractional 32000/60.0988 samples: Bresenham 532/533, remainder
+       9867296 / SNES_MASTER_HZ. The SPC catch-up itself stays per-scanline
+       in phase 0 so video and machine-state hashes do not move. */
+    want = SNES_SAMPLES_PER_FRAME_BASE;
+    d->samp_err += SNES_SAMPLES_BRES_STEP;
+    if (d->samp_err >= SNES_SAMPLES_BRES_MOD) {
+        d->samp_err -= SNES_SAMPLES_BRES_MOD;
+        want++;
+    }
+
+    smp = begin;
+    while (produced < want) {
         int l, r, ph;
-        while (ev < n && (int32_t)(slot->apu_log[ev].sample - smp) <= 0) apply_event(d, &slot->apu_log[ev++]);
+        while (ev < n && (int32_t)(slot->apu_log[ev].sample - smp) <= 0) {
+            apply_event(d, &slot->apu_log[ev++]);
+        }
         dsp_sample(d, &l, &r);
-        /* 32 kHz -> 48 kHz: outputs at input positions k*2/3 (thirds) */
         for (ph = (int)d->rs_phase; ph < 3; ph += 2) {
             int w = k_w[ph];
             if (out < max_frames) {
@@ -863,8 +893,19 @@ int hs_snes_synth_audio_phase(const hs_snes_slot *slot, hs_snes_dsp *d, int16_t 
         d->rs_phase -= 3u;
         d->prev_l = (int16_t)l;
         d->prev_r = (int16_t)r;
+        produced++;
+        smp++;
     }
     while (ev < n) apply_event(d, &slot->apu_log[ev++]);
-    d->sample_now = end;
+    d->sample_now = begin + want;
+    d->last_n32 = want;
+    d->last_n48 = (uint32_t)out;
+#ifdef HS_SNES_AUDIO_DEBUG
+    if (d->dbg_n < HS_SNES_DBG_FRAMES) {
+        d->dbg_n32[d->dbg_n] = (uint16_t)want;
+        d->dbg_n48[d->dbg_n] = (uint16_t)out;
+        d->dbg_n++;
+    }
+#endif
     return out;
 }

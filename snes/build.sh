@@ -37,8 +37,11 @@ for arch in x86_64 aarch64; do
   nb=$($NM $objs 2>/dev/null | grep -E -c "$BANNED")
   echo "[$arch] hc compiled_ok=$ok failed=$fail  hc_audit_elf_fail=$af  nm_banned_lock_symbols=$nb  objects=$(echo $objs | wc -w)"
   coreobjs="$out/hs_snes.o $out/snes_cpu.o $out/snes_bus.o $out/snes_ppu.o $out/snes_apu.o"
-  $CC -o $out/test_hs_snes $coreobjs $out/snes_testroms.o $out/png_write.o $out/test_hs_snes.o || rc=1
-  $CC -o $out/bench_hs_snes $coreobjs $out/snes_testroms.o $out/bench_hs_snes.o || rc=1
-  $CC -o $out/bench_mt_hs_snes $coreobjs $out/snes_testroms.o $out/bench_mt_hs_snes.o || rc=1
+  # aarch64 binaries are static so qemu-aarch64-static does not need a guest ld.so.
+  LDFLAGS=
+  if [ $arch = aarch64 ]; then LDFLAGS=-static; fi
+  $CC $LDFLAGS -o $out/test_hs_snes $coreobjs $out/snes_testroms.o $out/png_write.o $out/test_hs_snes.o || rc=1
+  $CC $LDFLAGS -o $out/bench_hs_snes $coreobjs $out/snes_testroms.o $out/bench_hs_snes.o || rc=1
+  $CC $LDFLAGS -o $out/bench_mt_hs_snes $coreobjs $out/snes_testroms.o $out/bench_mt_hs_snes.o || rc=1
 done
 exit $rc

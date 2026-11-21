@@ -202,6 +202,60 @@ static void run_demo(const char *name, const uint8_t *rom, size_t n, int frames,
     rig_free(r);
 }
 
+/* v5.7: 5-minute-equivalent audio run (18030 frames ≈ 5 min at 60.0988 Hz).
+   Skips PPU render; asserts Bresenham 532/533, 48 kHz 798/799, 0 clips. */
+#define SNES_AUDIO_LONG_FRAMES 18030
+#define SNES_AUDIO_DBG_LOG     600
+
+static void test_audio_long(const uint8_t *rom, size_t n)
+{
+    rig *r = rig_new(rom, n);
+    int f, n32_lo = 10000, n32_hi = 0, n48_lo = 10000, n48_hi = 0;
+    int bad32 = 0, bad48 = 0;
+    long total32 = 0, total48 = 0;
+    uint64_t ah = 0xcbf29ce484222325ull;
+    FILE *lg = fopen("snes-audio-debug.log", "w");
+
+    printf("[5] 5-min-equivalent SNES audio (%d frames)\n", SNES_AUDIO_LONG_FRAMES);
+    if (lg) {
+        fprintf(lg, "# frame n32 n48 clips peak\n");
+    }
+    for (f = 0; f < SNES_AUDIO_LONG_FRAMES; f++) {
+        hs_snes_slot *sl = r->slot[f & 1];
+        uint32_t n32, n48;
+        hs_snes_step_cpu_phase(r->s, sl);
+        r->pcm_n = hs_snes_synth_audio_phase(sl, r->dsp, r->pcm, HS_SNES_AUDIO_MAX);
+        n32 = r->dsp->last_n32;
+        n48 = r->dsp->last_n48;
+        total32 += n32;
+        total48 += n48;
+        ah = fnv_pcm(ah, r->pcm, r->pcm_n);
+        if ((int)n32 < n32_lo) n32_lo = (int)n32;
+        if ((int)n32 > n32_hi) n32_hi = (int)n32;
+        if ((int)n48 < n48_lo) n48_lo = (int)n48;
+        if ((int)n48 > n48_hi) n48_hi = (int)n48;
+        if (n32 != 532u && n32 != 533u) bad32++;
+        if (n48 != 798u && n48 != 799u && n48 != 800u) bad48++;
+        if (lg && f < SNES_AUDIO_DBG_LOG) {
+            fprintf(lg, "%d %u %u %u %u\n", f, n32, n48, r->dsp->clips, r->dsp->peak);
+        }
+    }
+    if (lg) fclose(lg);
+    printf("  n32 range=%d..%d bad32=%d total32=%ld\n", n32_lo, n32_hi, bad32, total32);
+    printf("  n48 range=%d..%d bad48=%d total48=%ld\n", n48_lo, n48_hi, bad48, total48);
+    printf("  clips=%u peak=%u HASH long-audio=%016llx\n",
+           r->dsp->clips, r->dsp->peak, (unsigned long long)ah);
+    CHECK(bad32 == 0, "Bresenham 532/533 only (bad=%d range=%d..%d)", bad32, n32_lo, n32_hi);
+    CHECK(bad48 == 0, "48 kHz 798..800 only (bad=%d range=%d..%d)", bad48, n48_lo, n48_hi);
+    CHECK(r->dsp->clips == 0, "no mixer clips (clips=%u peak=%u)", r->dsp->clips, r->dsp->peak);
+    /* 18030 frames * 532.4594 ≈ 9,600,243 32 kHz samples */
+    CHECK(total32 > 9599000 && total32 < 9602000,
+          "32 kHz 5-min count in range (%ld)", total32);
+    CHECK(r->slot[(SNES_AUDIO_LONG_FRAMES - 1) & 1]->apu_log_dropped == 0,
+          "APU log never overflowed in long run");
+    rig_free(r);
+}
+
 /* split PPU workers + pipelined phases must match serial bit-for-bit */
 static void test_split_pipeline(const uint8_t *rom, size_t n, uint64_t serial_v, uint64_t serial_a, int frames)
 {
@@ -267,6 +321,7 @@ int main(int argc, char **argv)
 
     printf("HASH mode1 video=%016llx audio=%016llx\n", (unsigned long long)m1.vhash, (unsigned long long)m1.ahash);
     printf("HASH mode7 video=%016llx audio=%016llx\n", (unsigned long long)m7.vhash, (unsigned long long)m7.ahash);
+    test_audio_long(rom1, i1.size);
     printf("RESULT pass=%d fail=%d\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

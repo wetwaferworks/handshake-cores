@@ -10,10 +10,23 @@
 #include "hs_snes.h"
 #include "snes_cpu.h"
 
-#define SNES_MASTER_PER_LINE   1364u
-#define SNES_LINES_PER_FRAME   262u
-#define SNES_MASTER_HZ         21477272ull
-#define SNES_SPC_HZ            1024000ull
+/* NTSC master clock is the single timebase for CPU, PPU, and audio.
+   Frame rate is SNES_MASTER_HZ / SNES_MASTER_PER_FRAME ≈ 60.0988 Hz.
+   32 kHz samples per frame = 32000 * SNES_MASTER_PER_FRAME / SNES_MASTER_HZ
+   = 532 + 9867296/21477272, emitted with a Bresenham 532/533 accumulator. */
+#define SNES_MASTER_PER_LINE         1364u
+#define SNES_LINES_PER_FRAME         262u
+#define SNES_MASTER_PER_FRAME        (SNES_MASTER_PER_LINE * SNES_LINES_PER_FRAME)
+#define SNES_MASTER_HZ               21477272ull
+#define SNES_SPC_HZ                  1024000ull
+#define SNES_DSP_RATE_HZ             32000u
+#define SNES_SAMPLES_PER_FRAME_BASE  532u
+#define SNES_SAMPLES_BRES_STEP       9867296u
+#define SNES_SAMPLES_BRES_MOD        21477272u
+/* Mix 8 voices + echo in 32-bit, then apply this right-shift before the
+   final clamp. 1 = -6 dB of headroom so loud echo-heavy scores do not
+   hard-clip mid-mix (a regular crackle source on A Link to the Past). */
+#define SNES_MIX_HEADROOM_SHIFT      1
 
 /* CPU-side PPU register file (mutated only by phase 0). */
 typedef struct snes_ppu_io {

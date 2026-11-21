@@ -72,10 +72,30 @@ gcc -O3 -o build/x86_64/test_hs_n64 $(objs x86_64) -lm
 aarch64-linux-gnu-gcc -O3 -static -o build/aarch64/test_hs_n64 $(objs aarch64) -lm
 # shellcheck disable=SC2046
 gcc -O3 -o build/x86_64/bench_n64 $(objs x86_64 bench_n64) -lm
-# shellcheck disable=SC2046
-aarch64-linux-gnu-gcc -O3 -static -o build/aarch64/bench_n64 $(objs aarch64 bench_n64) -lm
+# Shipped aarch64 tools: hs_rt + libgcc only (no glibc, no NPTL, zero mutex).
+RT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/handshakeos/src/hs_rt
+RT_CFLAGS="-std=c11 -O2 -mcpu=cortex-a53 -mno-outline-atomics -ffreestanding -fno-builtin -fno-stack-protector -U_FORTIFY_SOURCE -fno-tree-loop-distribute-patterns -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-pie -ffunction-sections -fdata-sections -Wall -Wextra -Werror"
+mkdir -p build/aarch64/hs_rt
+RTOBJS=""
+for s in start.S sys.c mem.c stdio.c; do
+  o=build/aarch64/hs_rt/${s%.*}.o
+  # shellcheck disable=SC2086
+  aarch64-linux-gnu-gcc $RT_CFLAGS -I"$RT" -c "$RT/$s" -o "$o"
+  RTOBJS="$RTOBJS $o"
+done
+SHIPLD="-O3 -static -nostdlib -nostartfiles -Wl,--gc-sections -Wl,-z,noexecstack"
+# shellcheck disable=SC2046,SC2086
+aarch64-linux-gnu-gcc $SHIPLD -o build/aarch64/bench_n64 $(objs aarch64 bench_n64) $RTOBJS -lgcc
 # on-device Panfrost probe (component main + n64_pf + runtime OS table); runs on the RG35XX
 gcc -O2 -o build/x86_64/hs_pf_probe build/x86_64/hs_pf_probe.o build/x86_64/n64_pf.o build/x86_64/n64_pf_sys.o
-aarch64-linux-gnu-gcc -O2 -static -o build/aarch64/hs_pf_probe build/aarch64/hs_pf_probe.o build/aarch64/n64_pf.o build/aarch64/n64_pf_sys.o
+# shellcheck disable=SC2086
+aarch64-linux-gnu-gcc $SHIPLD -o build/aarch64/hs_pf_probe build/aarch64/hs_pf_probe.o build/aarch64/n64_pf.o build/aarch64/n64_pf_sys.o $RTOBJS -lgcc
+# image-shipped tools must carry 0 lock symbols
+ship_hits=0
+for bin in build/aarch64/bench_n64 build/aarch64/hs_pf_probe; do
+  h=$(aarch64-linux-gnu-nm -a "$bin" | grep -E 'pthread|mutex|rwlock|spin_?lock|mtx_|cnd_|thrd_|futex' || true)
+  if [ -n "$h" ]; then echo "LOCK HIT $bin"; echo "$h"; ship_hits=$((ship_hits+1)); else echo "CLEAN $bin"; fi
+done
+[ $ship_hits = 0 ] || { echo "SHIPPED N64 TOOLS NOT ZERO-MUTEX"; exit 1; }
 wc -l src/*.c src/*.h include/*.h tests/test_hs_n64.c tests/bench_n64.c tools/*.c | tail -1 | sed 's/^/source lines (src+include+test+tools): /'
 [ $audit_fail = 0 ] && [ $nm_hits = 0 ] && [ $glob = 0 ] && echo "BUILD+AUDIT OK"
