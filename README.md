@@ -12,7 +12,10 @@
 - **CloudAtlas · Technical Art Director**: art (boot art, the animated o.O splash pack, squad ASCII)
 - **SpaceXAI**: makers of Grok Bot and the squad
 
-> **Zero mutex, with one exception.** Everything in the Handshake stack ships with zero mutexes: PID 1, the emulator cores, the runtime and the USB modules. The N64 core objects have 0 lock symbols. The v5.5 image has one exception: two N64 diagnostic tools, `bench_n64` and `hs_pf_probe`, are statically linked against glibc and carry its internal pthread mutex code. v5.6 removes the exception by relinking them against `hs_rt`, HandshakeOS's own lock-free runtime.
+> **Zero mutex in userspace.** The idea and the shape are JD's; the assistants co-implemented. From v5.6 on, the shipped userspace and PID 1 runtime are zero-mutex: PID 1 (`handshake-init`), the emulator cores (the N64 core objects included), the `hs_rt` runtime, the USB modules, and the N64 diagnostic tools `bench_n64` and `hs_pf_probe` (relinked against `hs_rt`) all scan clean, with 0 lock symbols. Evidence is in handshake-builds: `v5/v5.6/image-scan.txt`, `v5/v5.7/image-scan.txt`, and `v5/v5.8/image-scan.txt` each end in `IMAGE_ZERO_MUTEX_CLEAN` (`bench_n64` and `hs_pf_probe` CLEAN). The v5.9.1 run is `v5/v5.9.1/image-scan.txt`, `v5/v5.9.1/nm-locks.txt`, and `v5/v5.9.1/scan-run.txt` (`IMAGE_ZERO_MUTEX_CLEAN`, `NM_SUMMARY objects=186 lock_dirty=0`).
+>
+> The kernel underneath is mainline Linux 7.3.5 + ROCKNIX, which still has its own kernel mutexes (static count 1,599 mutex call sites; kernel work is next week). v5.8 and later ship kernel `7.3.5-hs-v58` on that base.
+
 
 ---
 
@@ -36,7 +39,9 @@ A core is a component in the HandshakeOS Timing Handshake (Jaydee Wetwork and El
 
 Because nothing is shared outside a phase boundary, a core needs no locks. **Every core object compiles under HC with 0 lock symbols**, the N64 core included (30/30 objects pass `hc --audit-elf`, with 0 lock, thread, clock or RNG symbols in its 26 component objects).
 
-**The one exception in v5.5:** two N64 *diagnostic tools* in this repo, `n64/tests/bench_n64.c` and `n64/tools/hs_pf_probe.c`, were linked as static glibc programs for the v5.5 image, and glibc's static library contains its own internal pthread mutex. They are diagnostic tools, not part of the core. v5.6 relinks them against HandshakeOS's own lock-free runtime, `hs_rt`.
+From v5.6 on, those two N64 *diagnostic tools* (`n64/tests/bench_n64.c` and `n64/tools/hs_pf_probe.c`) are relinked against HandshakeOS's own lock-free runtime, `hs_rt`, and scan CLEAN in the shipped images. They are diagnostic tools, not part of the core. The v5.5 image still used the old static-glibc link.
+
+The kernel underneath HandshakeOS is mainline Linux 7.3.5 + ROCKNIX, which still has its own kernel mutexes (static count 1,599 mutex call sites; kernel work is next week).
 
 ## What changed for v5.5
 
@@ -52,7 +57,13 @@ On a real Game Boy Color, original Game Boy games are coloured by the boot ROM, 
 - Tests: **307/307 on x86_64 and 307/307 on aarch64** (the original 282 plus 25 new).
 - Full write-up: [`n64/REPORT.md`](n64/REPORT.md), [`n64/docs/N64_COMPAT.md`](n64/docs/N64_COMPAT.md), [`n64/docs/PANFROST_PLAN.md`](n64/docs/PANFROST_PLAN.md).
 
-All timings above are from emulated or host runs. They are labelled, and they have not yet been measured on the RG35XX itself.
+All of those N64 timings are from emulated or host runs and are labelled as such.
+
+### SNES audio and pacing (after v5.5)
+
+The SNES core now has additional audio/pacing work (`snes/snes_apu.c`, `snes/hs_snes.c`, and `snes/docs/elfie-snes-audio-brief.md`). On the RG35XX 2024, SNES pacing is still the open problem: v5.8 ALttP ran at game_fps 40.6 / draw_fps 10.2 with emu_ms_avg 95 and 209 xruns in 23.5 s. v5.9's catch-up and pad-hold felt better, but the budget is still missed. The golden ledger hash `5f44cefa72e8ac19` is unchanged.
+
+The o.O boot art is CloudAtlas's splash pack, shipped with HandshakeOS. HC v0.1.4 is public in [handshakecompiler](https://github.com/wetwaferworks/handshakecompiler).
 
 ## Building and testing
 
@@ -66,13 +77,14 @@ cd n64 && ./run-tests.sh
 
 Every generator (demo ROMs, lookup tables) is a C program. There is no Python anywhere in this repo.
 
-## Still open (N64, short list)
+## Still open
 
-1. Real-A53 measurements on the handheld.
-2. Audio microcode HLE for SM64 and Zelda (currently silent).
-3. RDRAM framebuffer and Z write-back.
-4. S2DEX backgrounds.
-5. RDP LOD/mipmap, key, YUV, coverage/dither.
+1. SNES pacing on the H700 (main userspace issue).
+2. Real-A53 N64 measurements on the handheld.
+3. Audio microcode HLE for SM64 and Zelda (currently silent).
+4. RDRAM framebuffer and Z write-back.
+5. S2DEX backgrounds.
+6. RDP LOD/mipmap, key, YUV, coverage/dither.
 
 ## License
 
